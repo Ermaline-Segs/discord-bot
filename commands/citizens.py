@@ -19,6 +19,7 @@ the registry.
 
 from __future__ import annotations
 
+import functools
 import discord
 from discord.ext import commands
 
@@ -67,7 +68,7 @@ def _resolve_state(name: str):
 def admin_only():
     """Decorator: refuse non-admins before the command body runs."""
     def decorator(func):
-        @commands.wraps(func)
+        @functools.wraps(func)
         async def wrapper(ctx: commands.Context, *args, **kwargs):
             if not ctx.guild or not ctx.author.guild_permissions.administrator:
                 await ctx.send(
