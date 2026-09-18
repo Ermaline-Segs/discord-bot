@@ -1,132 +1,127 @@
+"""DELTA CITY bot entry point.
+
+What this file does
+-------------------
+This is the ONLY file that talks to Discord's API at startup. Everything
+else lives in its own module:
+
+    config/settings.py       -> names, states, roles, env vars
+    database/database.py     -> SQLite citizen registry + audit log
+    commands/government.py   -> !appoint, !dismiss, !government
+    commands/registration.py -> !register (modal flow)
+    commands/citizens.py     -> !citizen, !citizens, !move, !stateinfo, !dchelp
+    utils/helpers.py         -> shared formatters and role helpers
+
+Run the bot with:
+    python bot.py
+"""
+
+import logging
+import os
+
 import discord
 from discord.ext import commands
-import os
-import random
-from dotenv import load_dotenv
 
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
+from config import settings
+from database.database import DeltaCityDB
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("delta-city")
+
+# discord.py needs the message_content intent for prefix commands and the
+# members intent for on_member_join / on_member_remove.
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # needed so the bot can see role membership properly
+intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Cogs are plain extension paths; add new systems here, nothing else.
+EXTENSIONS = (
+    "commands.government",
+    "commands.registration",
+    "commands.citizens",
+)
 
-# ---- DATA: the shape of our government ----
-STATES = ["Asaba", "Warri", "Ughelli", "Ozoro", "Kwale", "Agbor"]
 
-NATIONAL_ROLES = [
-    "President", "Vice President",
-    "Senate President", "Deputy Senate President",
-    "Speaker", "Deputy Speaker"
-]
+class DeltaCityBot(commands.Bot):
+    """The bot itself. Subclasses commands.Bot so cogs can reach the shared
+    database via `self.bot.db` (one connection, one lock, no races)."""
 
-STATE_ROLES = [
-    "Governor", "Deputy Governor",
-    "State Speaker", "State Deputy Speaker"
-]
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+        self.db = DeltaCityDB(settings.DATABASE_PATH)
 
-# ---- HELPER: figure out the real role name from what the user typed ----
-def resolve_role_name(role_input: str):
-    words = role_input.strip().split()
-    last_word = words[-1]
+    async def setup_hook(self):
+        """Load every cog once, before the bot connects."""
+        for extension in EXTENSIONS:
+            await self.load_extension(extension)
+            log.info("Loaded cog: %s", extension)
 
-    # Check if the last word is a state name
-    matching_state = next((s for s in STATES if s.lower() == last_word.lower()), None)
+    async def on_ready(self):
+        log.info("Logged in as %s (ID %s)", self.user, self.user.id)
 
-    if matching_state:
-        title = " ".join(words[:-1])
-        matching_title = next((r for r in STATE_ROLES if r.lower() == title.lower()), None)
-        if matching_title:
-            return f"{matching_title} of {matching_state}"
-        return None
-    else:
-        matching_title = next((r for r in NATIONAL_ROLES if r.lower() == role_input.strip().lower()), None)
-        if matching_title:
-            return matching_title
-        return None
-
-# ---- COMMAND: appoint someone ----
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def appoint(ctx, member: discord.Member, *, role_input: str):
-    final_role_name = resolve_role_name(role_input)
-
-    if final_role_name is None:
-        await ctx.send(
-            "I don't recognize that role. Use a national title (e.g. `President`) "
-            "or a state title with the state name (e.g. `Governor Asaba`)."
+    async def on_member_join(self, member: discord.Member):
+        """Welcome new members and point them at !register."""
+        log.info("Member joined: %s (%s)", member, member.id)
+        message = (
+            f"👋 Welcome to **{settings.NATION_NAME}**, {member.mention}!\n\n"
+            "Every resident here holds a citizen profile. Get yours by "
+            "typing `!register` in chat — it takes under a minute."
         )
-        return
+        channel_id = settings.REGISTRATION_CHANNEL_ID
+        if channel_id:
+            channel = self.get_channel(int(channel_id))
+            if channel is not None:
+                await channel.send(
+                    f"🎉 **New arrival:** {member.mention} has joined "
+                    f"**{settings.NATION_NAME}**! They need to complete "
+                    "registration — see below.\n\n" + message
+                )
+                return
+        # Fall back to DM if no channel is configured (or it vanished).
+        try:
+            await member.send(message)
+        except discord.Forbidden:
+            log.warning(
+                "Could not DM %s (%s) — DMs closed; no public channel set.",
+                member,
+                member.id,
+            )
 
-    # Get the role, or create it if it doesn't exist yet
-    role = discord.utils.get(ctx.guild.roles, name=final_role_name)
-    if role is None:
-        role = await ctx.guild.create_role(name=final_role_name)
+    async def on_member_remove(self, member: discord.Member):
+        """Mark a registered citizen Inactive when they leave the server."""
+        row = self.db.get_citizen(member.id)
+        if row is None:
+            return
+        log.info("Member left: %s (%s), citizen %s", member, member.id, row["citizen_id"])
+        self.db.set_status(
+            member.id,
+            settings.INACTIVE_STATUS,
+            actor_id=None,
+        )
+        self.db.log_audit(
+            actor_id=None,
+            action="member_left",
+            subject_id=member.id,
+            details=f"Citizen {row['citizen_id']} set to {settings.INACTIVE_STATUS} on leave",
+        )
 
-    # If someone already holds this role, remove it from them first (unique office)
-    for old_holder in role.members:
-        await old_holder.remove_roles(role)
+    async def close(self):
+        self.db.close()
+        await super().close()
 
-    await member.add_roles(role)
-    await ctx.send(f"{member.mention} is now the {final_role_name}.")
 
-# ---- COMMAND: manually remove someone from a role ----
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def dismiss(ctx, member: discord.Member, *, role_input: str):
-    final_role_name = resolve_role_name(role_input)
+def main():
+    token = settings.TOKEN
+    if not token:
+        raise SystemExit(
+            "DISCORD_TOKEN is not set. Copy .env.example to .env and fill it in."
+        )
+    bot = DeltaCityBot()
+    bot.run(token)
 
-    if final_role_name is None:
-        await ctx.send("I don't recognize that role.")
-        return
 
-    role = discord.utils.get(ctx.guild.roles, name=final_role_name)
-    if role is None or role not in member.roles:
-        await ctx.send(f"{member.mention} doesn't hold that role.")
-        return
-
-    await member.remove_roles(role)
-    await ctx.send(f"{member.mention} has been removed from {final_role_name}.")
-
-# ---- COMMAND: show who holds what ----
-@bot.command()
-async def government(ctx):
-    lines = ["**National Government:**"]
-    for title in NATIONAL_ROLES:
-        role = discord.utils.get(ctx.guild.roles, name=title)
-        if role and role.members:
-            names = ", ".join(m.display_name for m in role.members)
-            lines.append(f"{title}: {names}")
-        else:
-            lines.append(f"{title}: *vacant*")
-
-    for state in STATES:
-        lines.append(f"\n**{state} State Government:**")
-        for title in STATE_ROLES:
-            full_name = f"{title} of {state}"
-            role = discord.utils.get(ctx.guild.roles, name=full_name)
-            if role and role.members:
-                names = ", ".join(m.display_name for m in role.members)
-                lines.append(f"{title}: {names}")
-            else:
-                lines.append(f"{title}: *vacant*")
-
-    await ctx.send("\n".join(lines))
-
-# ---- your earlier commands ----
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
-
-@bot.command()
-async def hello(ctx):
-    await ctx.send("Hello! I'm alive.")
-
-@bot.command()
-async def dice(ctx):
-    roll = random.randint(1, 6)
-    await ctx.send(f"You rolled a {roll}!")
-
-bot.run(TOKEN)
+if __name__ == "__main__":
+    main()
