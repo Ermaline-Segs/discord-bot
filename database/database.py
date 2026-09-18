@@ -12,6 +12,7 @@ on a single thread, and every method takes the lock so the same rules hold
 inside tests.
 """
 
+import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -32,6 +33,10 @@ class DeltaCityDB:
     def __init__(self, db_path):
         self.db_path = str(db_path)
         self._lock = threading.RLock()
+        # SQLite refuses to connect when the parent folder of the db file
+        # does not exist yet (fresh clones have no data/ directory).
+        parent = os.path.dirname(os.path.abspath(self.db_path))
+        os.makedirs(parent, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
