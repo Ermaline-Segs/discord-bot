@@ -434,4 +434,4 @@ class Citizens(commands.Cog):
 
 async def setup(bot: commands.Bot):
     """Called by discord.py when the cog is loaded from bot.py."""
-    await bot.add_cog(CitizensCog(bot))
+    await bot.add_cog(Citizens(bot))
