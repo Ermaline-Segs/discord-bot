@@ -26,6 +26,7 @@ import discord
 from discord.ext import commands
 
 from config import settings
+from delta_city import permissions
 from utils import helpers
 
 
@@ -46,10 +47,14 @@ class Government(commands.Cog):
     @commands.command(
         name="appoint",
         help="Appoint someone to a government office. "
-             "Examples: `!appoint @user President` or `!appoint @user Governor Asaba` (admin only).",
+             "Examples: `!appoint @user President` or `!appoint @user Governor Asaba` "
+             "(admins, President, Vice President, Chief of Staff, or the Chief Administrator).",
     )
-    @commands.has_permissions(administrator=True)
     async def appoint(self, ctx, member: discord.Member, *, role_input: str):
+        ok, reason = permissions.can_appoint(ctx.author)
+        if not ok:
+            await ctx.reply(reason, mention_author=False)
+            return
         office = helpers.parse_role_input(role_input)
         if office is None:
             await ctx.send(
@@ -144,10 +149,14 @@ class Government(commands.Cog):
     @commands.command(
         name="dismiss",
         help="Remove someone from a government office. "
-             "Examples: `!dismiss @user Governor Asaba` or `!dismiss @user Senator` (admin only).",
+             "Examples: `!dismiss @user Governor Asaba` or `!dismiss @user Senator` "
+             "(admins, President, Vice President, Chief of Staff, or the Chief Administrator).",
     )
-    @commands.has_permissions(administrator=True)
     async def dismiss(self, ctx, member: discord.Member, *, role_input: str):
+        ok, reason = permissions.can_appoint(ctx.author)
+        if not ok:
+            await ctx.reply(reason, mention_author=False)
+            return
         office = helpers.parse_role_input(role_input)
         if office is None:
             await ctx.send(

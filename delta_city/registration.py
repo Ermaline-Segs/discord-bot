@@ -746,30 +746,60 @@ class ImmigrationView(discord.ui.View):
     async def _assign_citizen_roles(
         self, guild: discord.Guild, member: discord.Member, city: str
     ) -> None:
-        """Grant the national role plus the selected city's citizen role."""
+        """Grant the national role plus the selected city's citizen role.
+
+        Enforces the one-state-at-a-time rule: any citizen role from a
+        *different* city is stripped first (a member is either a citizen
+        of one state or a visitor of another).  The Unverified role is
+        removed as well.  Granting *city*'s citizen role is what unlocks
+        the member's state category —
+        :func:`delta_city.permissions.overrides_for_category` allows
+        exactly those roles.
+        """
         added = []
         deltaian = self._find_role(guild, "Deltaian")
         if deltaian is not None and deltaian not in member.roles:
             await member.add_roles(deltaian, reason="Delta City registration")
             added.append(deltaian.name)
+
+        # Exclusivity: a citizen holds exactly one state's citizenship.
+        stripped = []
+        for other_city in identity.CITY_PREFIXES:
+            if other_city.lower() == city.lower():
+                continue
+            for role_name in permissions.city_role_names(other_city):
+                role = discord.utils.get(guild.roles, name=role_name)
+                if role is not None and role in member.roles:
+                    await member.remove_roles(
+                        role, reason=f"Citizenship moved to {city}"
+                    )
+                    stripped.append(role.name)
+
         city_role = permissions.find_city_role(guild, city)
         if city_role is not None and city_role not in member.roles:
             await member.add_roles(
                 city_role, reason=f"Delta City registration ({city})"
             )
             added.append(city_role.name)
+
+        unverified = await permissions.remove_unverified_role(member)
+        if unverified is not None:
+            stripped.append(unverified.name)
+
         if added:
             log.info("Assigned %s to %s (%s)", ", ".join(added), member.id, city)
+        if stripped:
+            log.info("Removed %s from %s (%s)", ", ".join(stripped), member.id, city)
 
     @staticmethod
     def _find_role(guild: discord.Guild, fragment: str):
         import unicodedata
 
-        def _has_name(role: discord.Role) -> bool:
+        for role in guild.roles:
             name = unicodedata.normalize("NFKC", role.name or "")
-            return fragment in name
-
-        return discord.utils.get(guild.roles, predicate=_has_name)
+            if fragment in name:
+                return role
+        return None
 
     async def _announce_arrival(
         self, guild: discord.Guild, record: Mapping[str, Any], card_png: bytes
@@ -918,6 +948,12 @@ class ImmigrationCog(commands.Cog):
             except discord.Forbidden:
                 pass
             return
+        # Stamp Unverified — locks the newcomer to #airport and #citizens
+        # until an officer completes their registration.
+        try:
+            await permissions.add_unverified_role(member)
+        except discord.HTTPException as exc:
+            log.warning("Could not stamp Unverified on %s: %s", member, exc)
         channel = self._arrival_channel(member.guild)
         if channel is not None:
             embed = discord.Embed(
@@ -958,9 +994,100 @@ class ImmigrationCog(commands.Cog):
             await ctx.reply("🛬 Registration only works inside a server.")
 
     @commands.command(name="register", hidden=False)
-    async def cmd_register(self, ctx: commands.Context) -> None:
-        """Start (or resume) citizen registration — alias of !arrival."""
-        await self.cmd_arrival(ctx)
+    async def cmd_register(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+        city: str | None = None,
+    ) -> None:
+        """Officer command: open *member*'s citizen registration.
+
+        Only Discord Administrators, Immigration Officers and the Chief
+        Administrator may run this.  Protected targets (Discord Admins /
+        the Chief Administrator) can only be registered by the Chief
+        Administrator.  Optionally pass a city name to pre-select it;
+        the member then finishes the remaining steps on the posted form.
+        """
+        author = ctx.author
+        if not isinstance(author, discord.Member) or author.guild is None:
+            await ctx.reply("⚠️ !register only works inside a server.", ephemeral=True)
+            return
+        if member.guild is None or member.guild.id != author.guild.id:
+            await ctx.reply(
+                f"⚠️ You can only register members of this server. Got {member.mention}.",
+                ephemeral=True,
+            )
+            return
+
+        ok, reason = permissions.can_register(author, member)
+        if not ok:
+            await ctx.reply(reason, ephemeral=True)
+            return
+
+        if self.db is None:
+            await ctx.reply("⚠️ The citizen database is unavailable.", ephemeral=True)
+            return
+
+        existing = self.db.get_citizen(member.id)
+        if existing is not None:
+            await ctx.reply(render_already_registered(existing), ephemeral=True)
+            return
+
+        if self.db.has_active_registration(member.id):
+            await ctx.reply(
+                f"🛬 {member.mention} already has a registration in progress — "
+                "they can finish the form I already posted.",
+                ephemeral=True,
+            )
+            return
+
+        stage = "city"
+        session_city: str | None = None
+        if city is not None:
+            canonical = identity.validate_city(city)
+            if canonical is None:
+                await ctx.reply(
+                    "⚠️ Unknown city. Valid cities: "
+                    + ", ".join(sorted(identity.CITY_PREFIXES)),
+                    ephemeral=True,
+                )
+                return
+            stage = "community"
+            session_city = canonical
+
+        expires = (
+            datetime.now(timezone.utc) + timedelta(seconds=REGISTRATION_TIMEOUT)
+        ).isoformat()
+        self.db.create_registration_session(
+            member.id,
+            member.guild.id,
+            expires,
+            stage=stage,
+            channel_id=(
+                ctx.channel.id if isinstance(ctx.channel, discord.TextChannel) else None
+            ),
+        )
+        if session_city is not None:
+            self.db.update_registration_session(member.id, city=session_city)
+
+        view = ImmigrationView(member.id, self)
+        try:
+            sent = await ctx.reply(
+                f"🛬 {member.mention}, an Immigration Officer has opened your "
+                "citizen registration. Complete the form below to enter "
+                "Delta City.",
+                view=view,
+                mention_everyone=False,
+            )
+        except discord.HTTPException as exc:
+            log.warning("Could not post registration form for %s: %s", member.id, exc)
+            self.db.delete_registration_session(member.id)
+            await ctx.reply(
+                "⚠️ I couldn't post the registration form. Try again.",
+                ephemeral=True,
+            )
+            return
+        self.db.update_registration_session(member.id, message_id=sent.id)
 
     @commands.command(name="id", hidden=False)
     async def cmd_id(self, ctx: commands.Context) -> None:
@@ -997,7 +1124,7 @@ class ImmigrationCog(commands.Cog):
             )
         await ctx.reply(**kwargs)
 
-    @commands.command(name="immmigrate", aliases=["immigrate"])
+    @commands.command(name="immigrate", aliases=["immmigrate"])
     @commands.has_permissions(administrator=True)
     async def cmd_immmigrate(self, ctx: commands.Context) -> None:
         """Admin: repair missing roles/cards for all registered citizens."""
@@ -1070,8 +1197,8 @@ class ImmigrationCog(commands.Cog):
         return changed
 
 
-def setup(bot: commands.Bot) -> None:
-    bot.add_cog(ImmigrationCog(bot))
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(ImmigrationCog(bot))
     # Register a shared persistent instance. In-session, interactions are
     # routed by message_id to the per-user views attached at send time;
     # after a bot restart those in-memory registrations are gone, so
