@@ -1124,7 +1124,7 @@ class ImmigrationCog(commands.Cog):
             )
         await ctx.reply(**kwargs)
 
-    @commands.command(name="immmigrate", aliases=["immigrate"])
+    @commands.command(name="immigrate", aliases=["immmigrate"])
     @commands.has_permissions(administrator=True)
     async def cmd_immmigrate(self, ctx: commands.Context) -> None:
         """Admin: repair missing roles/cards for all registered citizens."""
@@ -1197,8 +1197,8 @@ class ImmigrationCog(commands.Cog):
         return changed
 
 
-def setup(bot: commands.Bot) -> None:
-    bot.add_cog(ImmigrationCog(bot))
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(ImmigrationCog(bot))
     # Register a shared persistent instance. In-session, interactions are
     # routed by message_id to the per-user views attached at send time;
     # after a bot restart those in-memory registrations are gone, so
