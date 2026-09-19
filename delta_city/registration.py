@@ -10,10 +10,12 @@ into two clearly separated halves:
     so the whole flow is unit-testable without a bot connection.
 
 2.  The Discord UI (``ImmigrationView``):
-    a *persistent* ``discord.ui.View`` whose children are declared as
-    class attributes, so discord.py can re-create it after a bot
-    restart without arguments.  The session in SQLite is the source of
-    truth: on every interaction the handler re-loads the session,
+    a *persistent* ``discord.ui.View`` whose children are declared with
+    item decorators and fixed custom ids, so discord.py can route
+    interactions on stale messages back to a single shared instance
+    registered via ``bot.add_view`` at startup (see ``setup`` below).
+    The session in SQLite is the source of truth: on every interaction
+    the handler re-loads the session,
     re-applies stage state (which select is live, which buttons are
     enabled), and re-renders the message copy.  Because the DB row is
     re-validated on every click, a restart never loses progress and a
@@ -352,9 +354,11 @@ def _select_options(values: list[str]) -> list[discord.SelectOption]:
 class ImmigrationView(discord.ui.View):
     """Persistent view driving the whole arrival/registration flow.
 
-    Children are class attributes (``city_select``, ``community_select``,
-    ``gender_select`` and the four action buttons) so discord.py can
-    reconstruct the view after a bot restart without constructor
+    Children are declared with the ``@discord.ui.select`` /
+    ``@discord.ui.button`` decorators (bare class-level ``Select`` /
+    ``Button`` instances are silently dropped by discord.py's
+    ``View.__init_subclass__``) with fixed ``custom_id``s, so discord.py
+    can reconstruct the view after a bot restart without constructor
     arguments.  ``_apply_stage`` (re)enables the correct children for the
     session's current stage and re-renders the message copy.
 
@@ -365,46 +369,68 @@ class ImmigrationView(discord.ui.View):
     error notice instead of corrupting data.
     """
 
-    # -- persistent children (class-level so restart reconstruction works) --
-    city_select = discord.ui.Select(
+    # -- persistent children (decorator-style; fixed custom ids so the
+    #    view can be reconstructed from a stored message after a restart) --
+
+    @discord.ui.select(
         placeholder=_DEFAULT_PLACEHOLDER,
         options=_select_options(list(identity.CITY_PREFIXES)),
         custom_id="dcim:city",
     )
-    community_select = discord.ui.Select(
+    async def city_select(self, interaction: discord.Interaction) -> None:
+        await self._handle_selection(interaction, self.city_select.value)
+
+    @discord.ui.select(
         placeholder=_DEFAULT_PLACEHOLDER,
         options=[],
         custom_id="dcim:community",
     )
-    gender_select = discord.ui.Select(
+    async def community_select(self, interaction: discord.Interaction) -> None:
+        await self._handle_selection(interaction, self.community_select.value)
+
+    @discord.ui.select(
         placeholder=_DEFAULT_PLACEHOLDER,
         options=_select_options(list(identity.GENDER_OPTIONS)),
         custom_id="dcim:gender",
     )
-    confirm_button = discord.ui.Button(
+    async def gender_select(self, interaction: discord.Interaction) -> None:
+        await self._handle_selection(interaction, self.gender_select.value)
+
+    @discord.ui.button(
         label="Confirm",
         emoji="✅",
         custom_id="dcim:confirm",
         style=discord.ButtonStyle.success,
     )
-    regenerate_button = discord.ui.Button(
+    async def confirm_button(self, interaction: discord.Interaction) -> None:
+        await self._finalize(interaction, respond=True)
+
+    @discord.ui.button(
         label="Regenerate",
         emoji="🔄",
         custom_id="dcim:regenerate",
         style=discord.ButtonStyle.secondary,
     )
-    cancel_button = discord.ui.Button(
+    async def regenerate_button(self, interaction: discord.Interaction) -> None:
+        await self._regenerate(interaction)
+
+    @discord.ui.button(
         label="Cancel",
         emoji="❌",
         custom_id="dcim:cancel",
         style=discord.ButtonStyle.danger,
     )
-    retry_button = discord.ui.Button(
+    async def cancel_button(self, interaction: discord.Interaction) -> None:
+        await self._cancel(interaction)
+
+    @discord.ui.button(
         label="Retry",
         emoji="🔁",
         custom_id="dcim:retry",
         style=discord.ButtonStyle.success,
     )
+    async def retry_button(self, interaction: discord.Interaction) -> None:
+        await self._retry(interaction)
 
     def __init__(
         self,
@@ -438,10 +464,12 @@ class ImmigrationView(discord.ui.View):
     def _bind(self, interaction: discord.Interaction) -> None:
         """Re-attach per-user/cog state after a bot restart.
 
-        Persistent views are reconstructed by discord.py with no
-        constructor arguments, so ``user_id``/``_cog`` may be missing on
-        stale messages.  The interaction itself always knows the real
-        user and the running bot, so we re-bind from it.
+        After a restart the in-memory per-message view registrations are
+        gone, so discord.py routes interactions on stale messages to the
+        single shared persistent instance registered in ``setup`` via
+        ``bot.add_view``.  That instance carries no user context, so the
+        interaction itself is the source of truth: re-bind ``user_id``
+        and the cog from it.
         """
         if self.user_id != interaction.user.id:
             self.user_id = int(interaction.user.id)
@@ -464,20 +492,6 @@ class ImmigrationView(discord.ui.View):
         # Buttons appear only on the review stage.
         for button in (self.confirm_button, self.regenerate_button, self.cancel_button):
             button.disabled = stage != "review"
-
-    # -- select callbacks ---------------------------------------------------
-
-    @city_select.callback
-    async def _on_city_select(self, interaction: discord.Interaction) -> None:
-        await self._handle_selection(interaction, self.city_select.value)
-
-    @community_select.callback
-    async def _on_community_select(self, interaction: discord.Interaction) -> None:
-        await self._handle_selection(interaction, self.community_select.value)
-
-    @gender_select.callback
-    async def _on_gender_select(self, interaction: discord.Interaction) -> None:
-        await self._handle_selection(interaction, self.gender_select.value)
 
     async def _handle_selection(
         self, interaction: discord.Interaction, value: str
@@ -523,18 +537,10 @@ class ImmigrationView(discord.ui.View):
                 f"Use `!arrival` to restart your registration.", ephemeral=True
             )
 
-    # -- button callbacks ---------------------------------------------------
-
-    @confirm_button.callback
-    async def _on_confirm(self, interaction: discord.Interaction) -> None:
+    async def _retry(self, interaction: discord.Interaction) -> None:
         await self._finalize(interaction, respond=True)
 
-    @retry_button.callback
-    async def _on_retry(self, interaction: discord.Interaction) -> None:
-        await self._finalize(interaction, respond=True)
-
-    @regenerate_button.callback
-    async def _on_regenerate(self, interaction: discord.Interaction) -> None:
+    async def _regenerate(self, interaction: discord.Interaction) -> None:
         self._bind(interaction)
         session = self._load_session()
         if is_expired(session):
@@ -568,8 +574,7 @@ class ImmigrationView(discord.ui.View):
                 f"Use `!arrival` to restart your registration.", ephemeral=True
             )
 
-    @cancel_button.callback
-    async def _on_cancel(self, interaction: discord.Interaction) -> None:
+    async def _cancel(self, interaction: discord.Interaction) -> None:
         self._bind(interaction)
         db = self._db()
         if db:
@@ -584,6 +589,7 @@ class ImmigrationView(discord.ui.View):
     async def _finalize(self, interaction: discord.Interaction, *, respond: bool) -> None:
         """Run identity generation, issue the record, assign roles, announce."""
         self._bind(interaction)
+        user_id = self.user_id  # capture before any await; the shared instance may be rebound
         session = self._load_session()
         if is_expired(session) or not is_complete(session):
             db = self._db()
@@ -626,15 +632,20 @@ class ImmigrationView(discord.ui.View):
             except discord.HTTPException:
                 pass
         try:
-            await self._run_processing(interaction, city, community, gender, name, db)
+            await self._run_processing(interaction, user_id, city, community, gender, name, db)
         except Exception as exc:  # noqa: BLE001 - registration must never die silently
-            log.exception("Registration processing failed for %s", self.user_id)
-            self.clear_items()
-            self.retry_button.disabled = False
-            self.cancel_button.disabled = False
+            log.exception("Registration processing failed for %s", user_id)
+            # The instance may now be bound to another user's in-flight
+            # interaction; never wipe the shared instance in that case.
+            still_ours = self.user_id == user_id
+            if still_ours:
+                self.clear_items()
+                self.retry_button.disabled = False
+                self.cancel_button.disabled = False
             try:
                 await interaction.followup.send(
-                    render_processing_failed(str(exc)[:200]), view=self
+                    render_processing_failed(str(exc)[:200]),
+                    view=self if still_ours else None,
                 )
             except discord.HTTPException:
                 pass
@@ -642,13 +653,19 @@ class ImmigrationView(discord.ui.View):
     async def _run_processing(
         self,
         interaction: discord.Interaction,
+        user_id: int,
         city: str,
         community: str,
         gender: str,
         name: str,
         db,
     ) -> None:
-        """Animated processing sequence ending in a fully issued record."""
+        """Animated processing sequence ending in a fully issued record.
+
+        ``user_id`` is captured before any await by the caller, because
+        the shared persistent instance may be rebound to another user's
+        interaction while this coroutine is suspended.
+        """
         if self._db() is None:
             raise RuntimeError("Registration database unavailable.")
 
@@ -668,7 +685,7 @@ class ImmigrationView(discord.ui.View):
         # 1) Issue the record (sequential, unique Citizen ID inside a
         #    transaction; never a second identity for the same account).
         record, created = db.register_citizen(
-            self.user_id, name=name, gender=gender, state=city,
+            user_id, name=name, gender=gender, state=city,
             community=community, nationality=NATIONALITY,
         )
         if not created:
@@ -695,10 +712,10 @@ class ImmigrationView(discord.ui.View):
         if card_png:
             paths = _store_citizen_files(db, citizen_id, portrait_png, card_png)
             if paths:
-                db.attach_citizen_files(self.user_id, **paths)
+                db.attach_citizen_files(user_id, **paths)
 
         # 3) Close the session — the identity is now permanent.
-        db.delete_registration_session(self.user_id)
+        db.delete_registration_session(user_id)
         self._session = None
 
         # 4) Roles: 🇩🇨 Deltaian (national) + the city citizen role.
@@ -1055,3 +1072,11 @@ class ImmigrationCog(commands.Cog):
 
 def setup(bot: commands.Bot) -> None:
     bot.add_cog(ImmigrationCog(bot))
+    # Register a shared persistent instance. In-session, interactions are
+    # routed by message_id to the per-user views attached at send time;
+    # after a bot restart those in-memory registrations are gone, so
+    # discord.py falls back to this message-less registration and routes
+    # stale interactions here. Each callback re-binds user_id from the
+    # interaction and re-reads the session from SQLite, so the shared
+    # instance is safe.
+    bot.add_view(ImmigrationView(0))
