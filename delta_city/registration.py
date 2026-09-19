@@ -1000,13 +1000,12 @@ class ImmigrationCog(commands.Cog):
         member: discord.Member | None = None,
         city: str | None = None,
     ) -> None:
-        """Open a citizen registration.
+        """Open a citizen registration for another member.
 
-        Bare `!register` registers the invoking member (self-service,
-        same as `!arrival`).  `!register @user` registers another
-        member and is limited to Discord Administrators, Immigration
-        Officers and the Chief Administrator.  Protected targets
-        (Discord Admins / the Chief Administrator) can only be
+        Not self-service: only an Immigration Officer, a Discord
+        Administrator or the Chief Administrator can run `!register`
+        (members self-register with `!arrival` instead).  Protected
+        targets (Discord Admins / the Chief Administrator) can only be
         registered by the Chief Administrator.  Optionally pass a city
         name to pre-select it; the member then finishes the remaining
         steps on the posted form.
@@ -1016,8 +1015,14 @@ class ImmigrationCog(commands.Cog):
             await ctx.reply("⚠️ !register only works inside a server.", ephemeral=True)
             return
         if member is None:
-            member = author
-        self_register = member.id == author.id
+            await ctx.reply(
+                "🛬 Usage: `!register @user [city]` — registration is "
+                "carried out by an Immigration Officer, an Administrator "
+                "or the Chief Administrator. To register yourself, use "
+                "`!arrival`.",
+                ephemeral=True,
+            )
+            return
         if member.guild is None or member.guild.id != author.guild.id:
             await ctx.reply(
                 f"⚠️ You can only register members of this server. Got {member.mention}.",
@@ -1025,11 +1030,10 @@ class ImmigrationCog(commands.Cog):
             )
             return
 
-        if not self_register:
-            ok, reason = permissions.can_register(author, member)
-            if not ok:
-                await ctx.reply(reason, ephemeral=True)
-                return
+        ok, reason = permissions.can_register(author, member)
+        if not ok:
+            await ctx.reply(reason, ephemeral=True)
+            return
 
         if self.db is None:
             await ctx.reply("⚠️ The citizen database is unavailable.", ephemeral=True)
@@ -1041,19 +1045,11 @@ class ImmigrationCog(commands.Cog):
             return
 
         if self.db.has_active_registration(member.id):
-            if self_register:
-                await ctx.reply(
-                    "🛬 You already have a registration in progress — "
-                    "finish the form I already posted (or use `!arrival` to "
-                    "see its status).",
-                    ephemeral=True,
-                )
-            else:
-                await ctx.reply(
-                    f"🛬 {member.mention} already has a registration in "
-                    "progress — they can finish the form I already posted.",
-                    ephemeral=True,
-                )
+            await ctx.reply(
+                f"🛬 {member.mention} already has a registration in "
+                "progress — they can finish the form I already posted.",
+                ephemeral=True,
+            )
             return
 
         stage = "city"
@@ -1087,19 +1083,10 @@ class ImmigrationCog(commands.Cog):
 
         view = ImmigrationView(member.id, self)
         try:
-            if self_register:
-                intro = (
-                    f"🛬 {member.mention}, your citizen registration is now "
-                    "open. Complete the form below to enter Delta City."
-                )
-            else:
-                intro = (
-                    f"🛬 {member.mention}, an Immigration Officer has opened "
-                    "your citizen registration. Complete the form below to "
-                    "enter Delta City."
-                )
             sent = await ctx.reply(
-                intro,
+                f"🛬 {member.mention}, an Immigration Officer has opened your "
+                "citizen registration. Complete the form below to enter "
+                "Delta City.",
                 view=view,
                 mention_everyone=False,
             )
