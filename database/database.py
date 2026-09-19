@@ -2,10 +2,11 @@
 
 Tables
 ------
-citizens        one row per registered Discord member
-state_counters  per-state sequence used to build citizen IDs
-appointments    active and historical government appointments
-audit_log       append-only history of notable actions
+citizens                one row per registered Discord member
+state_counters          per-state sequence used to build citizen IDs
+appointments            active and historical government appointments
+audit_log               append-only history of notable actions
+registration_sessions   in-progress immigration assessments (survives restarts)
 
 The class is intentionally small and synchronous: discord.py already runs
 on a single thread, and every method takes the lock so the same rules hold
@@ -88,9 +89,28 @@ class DeltaCityDB:
                     ON appointments(role_name, active);
                 CREATE INDEX IF NOT EXISTS idx_citizens_state
                     ON citizens(state);
+                CREATE INDEX IF NOT EXISTS idx_citizens_citizen_id
+                    ON citizens(citizen_id);
+
+                CREATE TABLE IF NOT EXISTS registration_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    discord_id TEXT UNIQUE NOT NULL,
+                    guild_id TEXT NOT NULL,
+                    stage TEXT NOT NULL DEFAULT 'city',
+                    city TEXT,
+                    community TEXT,
+                    gender TEXT,
+                    generated_name TEXT,
+                    message_id TEXT,
+                    channel_id TEXT,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_registered_state()
+            self._ensure_citizen_columns()
             for state in STATES:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO state_counters (state, next_number) "
@@ -114,6 +134,39 @@ class DeltaCityDB:
                     "WHERE registered_state IS NULL"
                 )
                 self._conn.commit()
+
+    # Future-facing identity fields. These are populated by the
+    # immigration flow (portrait / ID card) and left as placeholders for
+    # residence, employment and passport systems that will connect to the
+    # Citizen ID later. None of them affect identity issuance.
+    _CITIZEN_COLUMNS = (
+        ("community", "TEXT"),
+        ("nationality", "TEXT DEFAULT 'Deltaian'"),
+        ("portrait_path", "TEXT"),
+        ("id_card_path", "TEXT"),
+        ("residence", "TEXT"),
+        ("employment", "TEXT"),
+        ("passport", "TEXT"),
+    )
+
+    def _ensure_citizen_columns(self):
+        """Add identity/document columns to older databases, if missing."""
+        with self._lock:
+            cols = [
+                row[1]
+                for row in self._conn.execute("PRAGMA table_info(citizens)")
+            ]
+            for column, declaration in self._CITIZEN_COLUMNS:
+                if column not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE citizens ADD COLUMN {column} {declaration}"
+                    )
+            if "nationality" in [c for c, _ in self._CITIZEN_COLUMNS]:
+                self._conn.execute(
+                    "UPDATE citizens SET nationality = 'Deltaian' "
+                    "WHERE nationality IS NULL"
+                )
+            self._conn.commit()
 
     def _get_row(self, discord_id):
         """Return the citizen row for a Discord user ID, or None.
@@ -176,12 +229,19 @@ class DeltaCityDB:
         gender: str,
         state: str,
         status: str = "Citizen",
+        community: str | None = None,
+        nationality: str = "Deltaian",
     ) -> tuple:
         """Create a citizen profile and return (row_dict, created: bool).
 
         If the Discord account already has a profile, the existing record
         is returned and created is False — Citizen IDs are permanent and
         are never re-issued, even after the member leaves and rejoins.
+
+        ``community`` is the citizen's chosen community/heritage for the
+        selected city (e.g. "Anioma", "Urhobo"); ``Pidgin`` is stored
+        verbatim as a linguistic community, never labelled as a tribe.
+        ``nationality`` defaults to the fictional "Deltaian" nationality.
         """
         if state not in STATE_CODES:
             raise ValueError(f"Unknown state: {state}")
@@ -195,8 +255,9 @@ class DeltaCityDB:
             with self._conn:
                 self._conn.execute(
                     "INSERT INTO citizens (discord_id, citizen_id, name, gender, "
-                    "registered_state, state, status, joined_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "registered_state, state, status, community, nationality, "
+                    "joined_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         str(int(discord_id)),
                         citizen_id,
@@ -205,6 +266,8 @@ class DeltaCityDB:
                         state,
                         state,
                         status,
+                        community,
+                        nationality,
                         now,
                         now,
                     ),
@@ -219,6 +282,40 @@ class DeltaCityDB:
                 self._get_row(int(discord_id)),
                 True,
             )
+
+    def attach_citizen_files(
+        self,
+        discord_id,
+        portrait_path: str | None = None,
+        id_card_path: str | None = None,
+    ) -> dict | None:
+        """Store generated document references for a citizen.
+
+        Called after portrait / ID-card PNG generation. Passing None for a
+        path leaves the existing value untouched (retry-safe: a failed
+        portrait generation does not wipe a previously attached card).
+        """
+        updates = {}
+        if portrait_path is not None:
+            updates["portrait_path"] = portrait_path
+        if id_card_path is not None:
+            updates["id_card_path"] = id_card_path
+        with self._lock, self._conn:
+            if updates:
+                sets = ", ".join(f"{k} = ?" for k in updates)
+                self._conn.execute(
+                    f"UPDATE citizens SET {sets}, updated_at = ? "
+                    "WHERE discord_id = ?",
+                    (*updates.values(), _now(), str(int(discord_id))),
+                )
+            self.log_audit(
+                actor_id=None,
+                action="attach_files",
+                subject_id=discord_id,
+                details=", ".join(f"{k}={v}" for k, v in updates.items())
+                or "no-op",
+            )
+        return self._get_row(int(discord_id))
 
     # ---- lookups ----
 
@@ -291,6 +388,15 @@ class DeltaCityDB:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM citizens ORDER BY citizen_id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_active_citizens(self):
+        """Citizens whose status is ACTIVE (for immigration audits)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM citizens WHERE status = ? ORDER BY citizen_id",
+                ("ACTIVE",),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -468,8 +574,138 @@ class DeltaCityDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # ---- registration sessions (immigration flow) ----
+
+    def create_registration_session(
+        self,
+        discord_id,
+        guild_id,
+        expires_at,
+        stage: str = "city",
+        message_id=None,
+        channel_id=None,
+    ):
+        """Create (or replace) the in-progress immigration session for a user.
+
+        At most one active session exists per Discord account; starting a
+        new registration replaces any stale one.
+        """
+        now = _now()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM registration_sessions WHERE discord_id = ?",
+                (str(int(discord_id)),),
+            )
+            self._conn.execute(
+                "INSERT INTO registration_sessions "
+                "(discord_id, guild_id, stage, city, community, gender, "
+                "generated_name, message_id, channel_id, started_at, "
+                "updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(int(discord_id)),
+                    str(int(guild_id)),
+                    stage,
+                    None,
+                    None,
+                    None,
+                    None,
+                    str(int(message_id)) if message_id is not None else None,
+                    str(int(channel_id)) if channel_id is not None else None,
+                    now,
+                    now,
+                    expires_at,
+                ),
+            )
+        return self.get_registration_session(discord_id)
+
+    def get_registration_session(self, discord_id):
+        """Return the in-progress session dict for a user, or None.
+
+        Sessions past their expiry are dropped on the spot (no record is
+        ever created from a stale session).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM registration_sessions WHERE discord_id = ?",
+                (str(int(discord_id)),),
+            ).fetchone()
+        if row is None:
+            return None
+        session = dict(row)
+        if _is_expired(session["expires_at"]):
+            self.delete_registration_session(discord_id)
+            return None
+        return session
+
+    def has_active_registration(self, discord_id) -> bool:
+        """True if the user has an in-progress registration session."""
+        return self.get_registration_session(discord_id) is not None
+
+    def update_registration_session(self, discord_id, **fields):
+        """Update whitelisted session fields; returns the fresh session."""
+        allowed = {
+            "stage",
+            "city",
+            "community",
+            "gender",
+            "generated_name",
+            "message_id",
+            "channel_id",
+            "expires_at",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        with self._lock, self._conn:
+            if not updates:
+                pass
+            else:
+                sets = ", ".join(f"{k} = ?" for k in updates)
+                values = list(updates.values())
+                if "expires_at" not in updates:
+                    self._conn.execute(
+                        f"UPDATE registration_sessions SET {sets}, "
+                        "updated_at = ? WHERE discord_id = ?",
+                        (*values, _now(), str(int(discord_id))),
+                    )
+                else:
+                    self._conn.execute(
+                        f"UPDATE registration_sessions SET {sets}, "
+                        "updated_at = ? WHERE discord_id = ?",
+                        (*values, _now(), str(int(discord_id))),
+                    )
+        return self.get_registration_session(discord_id)
+
+    def delete_registration_session(self, discord_id) -> bool:
+        """Delete a user's in-progress session. True if one existed."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM registration_sessions WHERE discord_id = ?",
+                (str(int(discord_id)),),
+            )
+            return cur.rowcount > 0
+
+    def expire_registration_sessions(self) -> int:
+        """Drop every session past its expiry. Returns how many expired."""
+        now = _now()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM registration_sessions WHERE expires_at <= ?",
+                (now,),
+            )
+            return cur.rowcount
+
     # ---- lifecycle ----
 
     def close(self):
         with self._lock:
             self._conn.close()
+
+
+def _is_expired(expires_at: str) -> bool:
+    """Compare an ISO-8601 expiry string against the current UTC time."""
+    try:
+        expiry = datetime.fromisoformat(expires_at)
+    except (TypeError, ValueError):
+        return True
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) >= expiry
