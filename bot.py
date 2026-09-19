@@ -8,7 +8,7 @@ else lives in its own module:
     config/settings.py       -> names, states, roles, env vars
     database/database.py     -> SQLite citizen registry + audit log
     commands/government.py   -> !appoint, !dismiss, !government
-    commands/registration.py -> !register (modal flow)
+    delta_city/registration.py -> !arrival, !register, !id (immigration flow)
     commands/citizens.py     -> !citizen, !citizens, !move, !stateinfo, !dchelp
     utils/helpers.py         -> shared formatters and role helpers
 
@@ -40,7 +40,7 @@ intents.members = True
 # Cogs are plain extension paths; add new systems here, nothing else.
 EXTENSIONS = (
     "commands.government",
-    "commands.registration",
+    "delta_city.registration",
     "commands.citizens",
 )
 
@@ -63,8 +63,18 @@ class DeltaCityBot(commands.Bot):
         log.info("Logged in as %s (ID %s)", self.user, self.user.id)
 
     async def on_member_join(self, member: discord.Member):
-        """Welcome new members and point them at !register."""
+        """Announce the arrival and start the immigration flow.
+
+        The immigration cog owns the whole arrival experience (announce in
+        #arrival-station, run the city/community/gender steps, issue the
+        identity). Delegate to it when it is loaded; fall back to the old
+        welcome message if it failed to load so no join goes unhandled.
+        """
         log.info("Member joined: %s (%s)", member, member.id)
+        cog = self.get_cog("ImmigrationCog")
+        if cog is not None:
+            await cog._on_member_join(member)
+            return
         message = (
             f"👋 Welcome to **{settings.NATION_NAME}**, {member.mention}!\n\n"
             "Every resident here holds a citizen profile. Get yours by "

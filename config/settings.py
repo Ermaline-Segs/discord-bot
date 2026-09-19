@@ -47,8 +47,8 @@ STATE_CODES = {
     "Asaba": "ASB",
     "Warri": "WAR",
     "Ughelli": "UGH",
-    "Ozoro": "OZR",
-    "Kwale": "KWL",
+    "Ozoro": "OZO",
+    "Kwale": "KWA",
     "Agbor": "AGB",
 }
 

@@ -147,9 +147,34 @@ class Citizens(commands.Cog):
     # ---- !citizen group ----------------------------------------------------
 
     @commands.group(invoke_without_command=True)
-    async def citizen(self, ctx: commands.Context, member: discord.Member = None):
-        """Show a citizen profile. Admins may look up other members."""
-        if member is not None and member.id != ctx.author.id:
+    async def citizen(self, ctx: commands.Context, target: str = None):
+        """Show a citizen profile.
+
+- `!citizen` — your own profile
+- `!citizen <citizen_id>` — public lookup, e.g. `!citizen DC-ASB-0001`
+- `!citizen @user` — another member's profile (admin only)
+        """
+        member = None
+        if target is not None and target.strip().upper().startswith("DC-"):
+            row = self.db.get_citizen_by_id(target.strip().upper())
+            if row is None:
+                await ctx.send(
+                    f"🪪 No citizen with ID `{target.strip().upper()}` exists."
+                )
+                return
+            await ctx.send(render_public_profile(row))
+            return
+        elif target is not None:
+            try:
+                member = await commands.MemberConverter().convert(ctx, target)
+            except commands.MemberNotFound:
+                await ctx.send("🪪 That member was not found in this server.")
+                return
+
+        if member is None:
+            member = ctx.author
+
+        if member.id != ctx.author.id:
             if not ctx.author.guild_permissions.administrator:
                 await ctx.send(
                     "⛔ Only administrators may view other people's "
