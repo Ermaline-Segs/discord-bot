@@ -2,17 +2,24 @@
 
 The Discord view itself is exercised indirectly here through the render
 helpers and the session state machine; the cog wiring is covered by
-import-time validation in the bot.
+import-time validation in the bot.  Command-level behaviour of the real
+``!register`` callback is covered by :class:`TestRegisterCommand` below
+using lightweight stand-ins (same pattern as test_permissions.py).
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
+import discord
 import pytest
+from discord.ext import commands
 
 import delta_city.registration as reg
-from delta_city import identity
+from delta_city import identity, permissions
 
 
 # ---------------------------------------------------------------------------
@@ -257,3 +264,153 @@ class TestRenderHelpers:
         assert "⚠️ **PROCESSING PROBLEM**" in text
         assert "portrait API down" in text
         assert "Retry" in text
+# ---------------------------------------------------------------------------
+# !register command behaviour (lightweight stand-ins for ctx / member / db)
+# ---------------------------------------------------------------------------
+
+
+def _guild(role_names):
+    return SimpleNamespace(
+        id=99,
+        roles=[SimpleNamespace(name=n) for n in role_names],
+        owner_id=None,
+        system_channel=None,
+        text_channels=[],
+    )
+
+
+def _member(guild, role_names, *, admin=False, user_id=1):
+    member = Mock(spec=discord.Member)
+    member.id = user_id
+    member.mention = f"<@{user_id}>"
+    member.roles = [r for r in guild.roles if r.name in role_names]
+    member.guild = guild
+    member.guild_permissions = SimpleNamespace(administrator=admin)
+    return member
+
+
+def _db():
+    return SimpleNamespace(
+        get_citizen=Mock(return_value=None),
+        has_active_registration=Mock(return_value=False),
+        create_registration_session=Mock(),
+        update_registration_session=Mock(),
+        delete_registration_session=Mock(),
+    )
+
+
+def _cog(db):
+    bot = Mock(spec=commands.Bot)
+    bot.db = db
+    return reg.ImmigrationCog(bot)
+
+
+def _ctx(author):
+    # A non-TextChannel channel object -> channel_id records as None.
+    return SimpleNamespace(author=author, channel=Mock(), reply=AsyncMock())
+
+
+class TestRegisterCommand:
+    """Real ``!register`` callback with mocked Discord objects.
+
+    The callback is driven with ``asyncio.run`` so the suite stays
+    free of an async-test plugin dependency.
+    """
+
+    def test_bare_register_self_registers_regular_member(self):
+        guild = _guild([])
+        member = _member(guild, [], user_id=5)
+        db = _db()
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_register.callback(cog, ctx))
+
+        db.get_citizen.assert_called_once_with(5)
+        assert db.has_active_registration.call_count == 1
+        assert db.create_registration_session.call_count == 1
+        args, kwargs = db.create_registration_session.call_args
+        assert args[0] == 5  # session belongs to the invoking member
+        assert args[1] == 99  # guild id
+        assert kwargs["stage"] == "city"
+        assert "your citizen registration is now open" in ctx.reply.await_args_list[0][0][0]
+        # Session id bound to the posted form message.
+        sent = ctx.reply.await_args_list[0][0][0]  # noqa: F841
+        assert db.update_registration_session.call_count >= 1
+
+    def test_bare_register_declines_existing_citizen(self):
+        guild = _guild([])
+        member = _member(guild, [], user_id=7)
+        db = _db()
+        db.get_citizen.return_value = {"id": "DC-0007", "first_name": "Ada"}
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_register.callback(cog, ctx))
+
+        db.create_registration_session.assert_not_called()
+        text = ctx.reply.await_args_list[0][0][0]
+        assert "already registered as a Delta City citizen" in text
+
+    def test_bare_register_declines_active_session(self):
+        guild = _guild([])
+        member = _member(guild, [], user_id=9)
+        db = _db()
+        db.has_active_registration.return_value = True
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_register.callback(cog, ctx))
+
+        db.create_registration_session.assert_not_called()
+        text = ctx.reply.await_args_list[0][0][0]
+        assert "already have a registration in progress" in text
+
+    def test_officer_can_register_another_member(self):
+        guild = _guild(["Immigration Officer"])
+        officer = _member(guild, ["Immigration Officer"], user_id=11)
+        target = _member(guild, [], user_id=12)
+        db = _db()
+        cog = _cog(db)
+        ctx = _ctx(officer)
+
+        asyncio.run(cog.cmd_register.callback(cog, ctx, member=target))
+
+        db.get_citizen.assert_called_once_with(12)
+        args, kwargs = db.create_registration_session.call_args
+        assert args[0] == 12  # session belongs to the target, not the officer
+        assert kwargs["stage"] == "city"
+        intro = ctx.reply.await_args_list[0][0][0]
+        assert "<@12>" in intro
+        assert "Immigration Officer has opened" in intro
+
+    def test_officer_register_with_city_presets_community_stage(self):
+        guild = _guild(["Immigration Officer"])
+        officer = _member(guild, ["Immigration Officer"], user_id=11)
+        target = _member(guild, [], user_id=12)
+        db = _db()
+        cog = _cog(db)
+        ctx = _ctx(officer)
+
+        asyncio.run(cog.cmd_register.callback(cog, ctx, member=target, city="Asaba"))
+
+        args, kwargs = db.create_registration_session.call_args
+        assert args[0] == 12
+        assert kwargs["stage"] == "community"
+        # City is persisted right after session creation.
+        city_args, _ = db.update_registration_session.call_args
+        assert city_args[0] == 12
+
+    def test_regular_member_cannot_register_another(self):
+        guild = _guild([])
+        author = _member(guild, [], user_id=5)
+        target = _member(guild, [], user_id=6)
+        db = _db()
+        cog = _cog(db)
+        ctx = _ctx(author)
+
+        asyncio.run(cog.cmd_register.callback(cog, ctx, member=target))
+
+        db.create_registration_session.assert_not_called()
+        text = ctx.reply.await_args_list[0][0][0]
+        assert "can run !register" in text

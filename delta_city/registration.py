@@ -997,21 +997,27 @@ class ImmigrationCog(commands.Cog):
     async def cmd_register(
         self,
         ctx: commands.Context,
-        member: discord.Member,
+        member: discord.Member | None = None,
         city: str | None = None,
     ) -> None:
-        """Officer command: open *member*'s citizen registration.
+        """Open a citizen registration.
 
-        Only Discord Administrators, Immigration Officers and the Chief
-        Administrator may run this.  Protected targets (Discord Admins /
-        the Chief Administrator) can only be registered by the Chief
-        Administrator.  Optionally pass a city name to pre-select it;
-        the member then finishes the remaining steps on the posted form.
+        Bare `!register` registers the invoking member (self-service,
+        same as `!arrival`).  `!register @user` registers another
+        member and is limited to Discord Administrators, Immigration
+        Officers and the Chief Administrator.  Protected targets
+        (Discord Admins / the Chief Administrator) can only be
+        registered by the Chief Administrator.  Optionally pass a city
+        name to pre-select it; the member then finishes the remaining
+        steps on the posted form.
         """
         author = ctx.author
         if not isinstance(author, discord.Member) or author.guild is None:
             await ctx.reply("⚠️ !register only works inside a server.", ephemeral=True)
             return
+        if member is None:
+            member = author
+        self_register = member.id == author.id
         if member.guild is None or member.guild.id != author.guild.id:
             await ctx.reply(
                 f"⚠️ You can only register members of this server. Got {member.mention}.",
@@ -1019,10 +1025,11 @@ class ImmigrationCog(commands.Cog):
             )
             return
 
-        ok, reason = permissions.can_register(author, member)
-        if not ok:
-            await ctx.reply(reason, ephemeral=True)
-            return
+        if not self_register:
+            ok, reason = permissions.can_register(author, member)
+            if not ok:
+                await ctx.reply(reason, ephemeral=True)
+                return
 
         if self.db is None:
             await ctx.reply("⚠️ The citizen database is unavailable.", ephemeral=True)
@@ -1034,11 +1041,19 @@ class ImmigrationCog(commands.Cog):
             return
 
         if self.db.has_active_registration(member.id):
-            await ctx.reply(
-                f"🛬 {member.mention} already has a registration in progress — "
-                "they can finish the form I already posted.",
-                ephemeral=True,
-            )
+            if self_register:
+                await ctx.reply(
+                    "🛬 You already have a registration in progress — "
+                    "finish the form I already posted (or use `!arrival` to "
+                    "see its status).",
+                    ephemeral=True,
+                )
+            else:
+                await ctx.reply(
+                    f"🛬 {member.mention} already has a registration in "
+                    "progress — they can finish the form I already posted.",
+                    ephemeral=True,
+                )
             return
 
         stage = "city"
@@ -1072,10 +1087,19 @@ class ImmigrationCog(commands.Cog):
 
         view = ImmigrationView(member.id, self)
         try:
+            if self_register:
+                intro = (
+                    f"🛬 {member.mention}, your citizen registration is now "
+                    "open. Complete the form below to enter Delta City."
+                )
+            else:
+                intro = (
+                    f"🛬 {member.mention}, an Immigration Officer has opened "
+                    "your citizen registration. Complete the form below to "
+                    "enter Delta City."
+                )
             sent = await ctx.reply(
-                f"🛬 {member.mention}, an Immigration Officer has opened your "
-                "citizen registration. Complete the form below to enter "
-                "Delta City.",
+                intro,
                 view=view,
                 mention_everyone=False,
             )
