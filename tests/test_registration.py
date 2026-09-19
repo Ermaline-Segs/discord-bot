@@ -317,7 +317,7 @@ class TestRegisterCommand:
     free of an async-test plugin dependency.
     """
 
-    def test_bare_register_self_registers_regular_member(self):
+    def test_bare_register_rejected_for_regular_member(self):
         guild = _guild([])
         member = _member(guild, [], user_id=5)
         db = _db()
@@ -326,45 +326,53 @@ class TestRegisterCommand:
 
         asyncio.run(cog.cmd_register.callback(cog, ctx))
 
-        db.get_citizen.assert_called_once_with(5)
-        assert db.has_active_registration.call_count == 1
-        assert db.create_registration_session.call_count == 1
-        args, kwargs = db.create_registration_session.call_args
-        assert args[0] == 5  # session belongs to the invoking member
-        assert args[1] == 99  # guild id
-        assert kwargs["stage"] == "city"
-        assert "your citizen registration is now open" in ctx.reply.await_args_list[0][0][0]
-        # Session id bound to the posted form message.
-        sent = ctx.reply.await_args_list[0][0][0]  # noqa: F841
-        assert db.update_registration_session.call_count >= 1
+        db.create_registration_session.assert_not_called()
+        text = ctx.reply.await_args_list[0][0][0]
+        assert "!register @user [city]" in text
+        assert "!arrival" in text
 
-    def test_bare_register_declines_existing_citizen(self):
-        guild = _guild([])
-        member = _member(guild, [], user_id=7)
+    def test_bare_register_rejected_for_officer(self):
+        guild = _guild(["Immigration Officer"])
+        officer = _member(guild, ["Immigration Officer"], user_id=11)
+        db = _db()
+        cog = _cog(db)
+        ctx = _ctx(officer)
+
+        asyncio.run(cog.cmd_register.callback(cog, ctx))
+
+        db.create_registration_session.assert_not_called()
+        text = ctx.reply.await_args_list[0][0][0]
+        assert "!register @user [city]" in text
+
+    def test_officer_register_declines_existing_citizen(self):
+        guild = _guild(["Immigration Officer"])
+        officer = _member(guild, ["Immigration Officer"], user_id=11)
+        target = _member(guild, [], user_id=7)
         db = _db()
         db.get_citizen.return_value = {"id": "DC-0007", "first_name": "Ada"}
         cog = _cog(db)
-        ctx = _ctx(member)
+        ctx = _ctx(officer)
 
-        asyncio.run(cog.cmd_register.callback(cog, ctx))
+        asyncio.run(cog.cmd_register.callback(cog, ctx, member=target))
 
         db.create_registration_session.assert_not_called()
         text = ctx.reply.await_args_list[0][0][0]
         assert "already registered as a Delta City citizen" in text
 
-    def test_bare_register_declines_active_session(self):
-        guild = _guild([])
-        member = _member(guild, [], user_id=9)
+    def test_officer_register_declines_active_session(self):
+        guild = _guild(["Immigration Officer"])
+        officer = _member(guild, ["Immigration Officer"], user_id=11)
+        target = _member(guild, [], user_id=9)
         db = _db()
         db.has_active_registration.return_value = True
         cog = _cog(db)
-        ctx = _ctx(member)
+        ctx = _ctx(officer)
 
-        asyncio.run(cog.cmd_register.callback(cog, ctx))
+        asyncio.run(cog.cmd_register.callback(cog, ctx, member=target))
 
         db.create_registration_session.assert_not_called()
         text = ctx.reply.await_args_list[0][0][0]
-        assert "already have a registration in progress" in text
+        assert "already has a registration in progress" in text
 
     def test_officer_can_register_another_member(self):
         guild = _guild(["Immigration Officer"])
