@@ -422,3 +422,255 @@ class TestRegisterCommand:
         db.create_registration_session.assert_not_called()
         text = ctx.reply.await_args_list[0][0][0]
         assert "can run !register" in text
+
+
+# ---------------------------------------------------------------------------
+# !cancel_registration + !arrival self-healing (ghost session repair)
+# ---------------------------------------------------------------------------
+
+
+def _channel(guild, name="airport"):
+    """A text channel stand-in that also satisfies guild.get_channel()."""
+    ch = SimpleNamespace(
+        id=1000,
+        name=name,
+        send=AsyncMock(return_value=SimpleNamespace(id=90000)),
+        fetch_message=AsyncMock(return_value=SimpleNamespace(id=90000)),
+        permissions_for=Mock(return_value=SimpleNamespace(view_channel=True)),
+    )
+    guild.text_channels.append(ch)
+    guild.get_channel = Mock(return_value=ch)
+    return ch
+
+
+class TestCancelRegistrationCommand:
+    """The ``!cancel_registration`` text escape hatch."""
+
+    def test_cancels_active_session(self):
+        guild = _guild([])
+        member = _member(guild, [], user_id=7)
+        db = _db()
+        db.delete_registration_session.return_value = True
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_cancel_registration.callback(cog, ctx))
+
+        db.delete_registration_session.assert_called_once_with(7)
+        text, = ctx.reply.await_args_list[0][0]
+        assert "cancelled" in text
+        assert "!arrival" in text
+        assert ctx.reply.await_args_list[0][1].get("ephemeral") is True
+
+    def test_no_session_in_progress(self):
+        guild = _guild([])
+        member = _member(guild, [], user_id=7)
+        db = _db()
+        db.delete_registration_session.return_value = False
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_cancel_registration.callback(cog, ctx))
+
+        db.delete_registration_session.assert_called_once_with(7)
+        text, = ctx.reply.await_args_list[0][0]
+        assert "don't have a registration in progress" in text
+        assert "!arrival" in text
+
+    def test_db_unavailable(self):
+        guild = _guild([])
+        member = _member(guild, [], user_id=7)
+        cog = _cog(None)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_cancel_registration.callback(cog, ctx))
+
+        text, = ctx.reply.await_args_list[0][0]
+        assert "unavailable" in text
+
+    def test_outside_server_rejected(self):
+        author = Mock(spec=discord.User)
+        cog = _cog(_db())
+        ctx = _ctx(author)
+
+        asyncio.run(cog.cmd_cancel_registration.callback(cog, ctx))
+
+        text, = ctx.reply.await_args_list[0][0]
+        assert "only works inside a server" in text
+
+
+class TestArrivalSelfHealing:
+    """``!arrival`` must not lock a user out on a ghost session."""
+
+    def test_already_registered_citizen(self):
+        guild = _guild([])
+        member = _member(guild, [], user_id=8)
+        db = _db()
+        db.get_citizen.return_value = {"citizen_id": "DC-WAR-0001"}
+        db.get_registration_session = Mock(return_value=None)
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_arrival.callback(cog, ctx))
+
+        db.create_registration_session.assert_not_called()
+        text, = ctx.reply.await_args_list[0][0]
+        assert "already registered" in text.lower()
+        assert "DC-WAR-0001" in text
+
+    def test_outside_server_rejected(self):
+        author = Mock(spec=discord.User)
+        cog = _cog(_db())
+        ctx = _ctx(author)
+
+        asyncio.run(cog.cmd_arrival.callback(cog, ctx))
+
+        text, = ctx.reply.await_args_list[0][0]
+        assert "only works inside a server" in text
+
+    def test_live_form_is_reused_not_recreated(self):
+        guild = _guild([])
+        _channel(guild)
+        member = _member(guild, [], user_id=9)
+        db = _db()
+        db.get_registration_session = Mock(
+            return_value={"user_id": 9, "message_id": 90000, "channel_id": 1000}
+        )
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_arrival.callback(cog, ctx))
+
+        db.delete_registration_session.assert_not_called()
+        db.create_registration_session.assert_not_called()
+        text, = ctx.reply.await_args_list[0][0]
+        assert "already have a registration in progress" in text
+        assert "!cancel_registration" in text
+
+    def test_stale_session_without_message_id_starts_clean(self):
+        guild = _guild([])
+        ch = _channel(guild)
+        member = _member(guild, [], user_id=10)
+        db = _db()
+        # Post failed after the row was written: no message_id stored.
+        db.get_registration_session = Mock(
+            return_value={"user_id": 10, "message_id": None, "channel_id": None}
+        )
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_arrival.callback(cog, ctx))
+
+        db.delete_registration_session.assert_called_once_with(10)
+        db.create_registration_session.assert_called_once()
+        sent = ch.send.await_args
+        assert "WELCOME TO DELTA CITY" in sent.kwargs.get("content") or any(
+            "WELCOME TO DELTA CITY" in str(a) for a in (sent.args or ())
+        )
+        # Session row now points at the real form message.
+        db.update_registration_session.assert_called_once_with(
+            10, message_id=90000, channel_id=1000
+        )
+
+    def test_stale_session_when_fetch_404_starts_clean(self):
+        guild = _guild([])
+        ch = _channel(guild)
+        ch.fetch_message = AsyncMock(
+            side_effect=discord.HTTPException(Mock(), "404 Not Found")
+        )
+        member = _member(guild, [], user_id=10)
+        db = _db()
+        db.get_registration_session = Mock(
+            return_value={"user_id": 10, "message_id": 4242, "channel_id": 1000}
+        )
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_arrival.callback(cog, ctx))
+
+        db.delete_registration_session.assert_called_once_with(10)
+        db.create_registration_session.assert_called_once()
+
+    def test_session_in_unknown_channel_starts_clean(self):
+        guild = _guild([])
+        _channel(guild)
+        member = _member(guild, [], user_id=10)
+        db = _db()
+        db.get_registration_session = Mock(
+            return_value={"user_id": 10, "message_id": 4242, "channel_id": 31337}
+        )
+        guild.get_channel = Mock(return_value=None)
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_arrival.callback(cog, ctx))
+
+        db.delete_registration_session.assert_called_once_with(10)
+        db.create_registration_session.assert_called_once()
+
+    def test_fresh_start_posts_form_in_airport(self):
+        guild = _guild([])
+        ch = _channel(guild)
+        member = _member(guild, [], user_id=11)
+        db = _db()
+        db.get_registration_session = Mock(return_value=None)
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_arrival.callback(cog, ctx))
+
+        db.delete_registration_session.assert_not_called()
+        args, kwargs = db.create_registration_session.call_args
+        assert args[0] == 11  # session belongs to the caller
+        assert kwargs["stage"] == "city"
+        assert kwargs["channel_id"] == 1000
+        # Expiry lands ~REGISTRATION_TIMEOUT from now.
+        expires_at = datetime.fromisoformat(args[2])
+        delta = expires_at - datetime.now(timezone.utc)
+        assert timedelta(
+            seconds=reg.REGISTRATION_TIMEOUT - 5
+        ) <= delta <= timedelta(seconds=reg.REGISTRATION_TIMEOUT + 5)
+        db.update_registration_session.assert_called_once_with(
+            11, message_id=90000, channel_id=1000
+        )
+
+    def test_no_visible_channel_dms_instead_of_ghost_session(self):
+        guild = _guild([])  # no text channels, no system channel
+        member = _member(guild, [], user_id=12)
+        member.send = AsyncMock()
+        db = _db()
+        db.get_registration_session = Mock(
+            return_value={"user_id": 12, "message_id": None, "channel_id": None}
+        )
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_arrival.callback(cog, ctx))
+
+        # Stale row is dropped, but NO new row is written — the user must
+        # not be locked out with a form they cannot see or cancel.
+        db.delete_registration_session.assert_called_once_with(12)
+        db.create_registration_session.assert_not_called()
+        member.send.assert_awaited_once()
+        assert "administrator" in member.send.await_args.args[0]
+
+    def test_form_post_failure_drops_session_and_dms(self):
+        guild = _guild([])
+        ch = _channel(guild)
+        ch.send = AsyncMock(
+            side_effect=discord.HTTPException(Mock(), "500 Server Error")
+        )
+        member = _member(guild, [], user_id=13)
+        member.send = AsyncMock()
+        db = _db()
+        db.get_registration_session = Mock(return_value=None)
+        cog = _cog(db)
+        ctx = _ctx(member)
+
+        asyncio.run(cog.cmd_arrival.callback(cog, ctx))
+
+        db.create_registration_session.assert_called_once()
+        # Ghost session rolled back so the next !arrival starts clean.
+        db.delete_registration_session.assert_called_once_with(13)
+        db.update_registration_session.assert_not_called()
+        member.send.assert_awaited_once()
