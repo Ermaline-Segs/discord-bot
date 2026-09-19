@@ -108,3 +108,28 @@ REQUIRE_CITIZEN_FOR_APPOINTMENT = True
 
 # How many audit entries the !dchelp / debug commands may show at once.
 AUDIT_RECENT_LIMIT = 10
+
+# ---- permission tiers -------------------------------------------------------
+# The one true authority. Full access to everything, server and bot, and the
+# ONLY role that may register or modify a Discord Admin / Chief Admin account.
+CHIEF_ADMIN_ROLE = "Chief Administrator"
+
+# May register citizens alongside admins — but never Admin or Chief Admin
+# accounts (protected targets; see delta_city.permissions.can_register).
+IMMIGRATION_OFFICER_ROLE = "Immigration Officer"
+
+# Stamped on every new member by on_member_join. While held, the member can
+# see only #airport and #citizens. Removed when registration completes.
+UNVERIFIED_ROLE = "Unverified"
+
+# Roles (beyond Discord Administrators and the Chief Administrator) that may
+# run !appoint / !dismiss.
+APPOINT_ALLOWED_ROLES = ["President", "Vice President", "Chief of Staff"]
+
+# Channels visible to Unverified members. Everything else is locked to
+# @everyone until registration removes the Unverified role.
+AIRPORT_CHANNEL_NAME = "airport"
+CITIZENS_CHANNEL_NAME = "citizens"
+
+# Tribal name pools live in delta_city/identity.py (NAME_POOLS, per community);
+# they are the source of truth for auto-generated citizen names.

@@ -111,6 +111,100 @@ def find_city_role(guild: Guild, city: str) -> discord.Role | None:
 
 
 # ---------------------------------------------------------------------------
+# Permission tiers (pure logic — testable without a guild)
+# ---------------------------------------------------------------------------
+
+
+def has_role(member, role_name: str) -> bool:
+    """True if *member* holds a role named exactly *role_name*."""
+    if not isinstance(member, discord.Member):
+        return False
+    return any(r.name == role_name for r in member.roles)
+
+
+def is_discord_admin(member) -> bool:
+    """True for Discord server Administrators."""
+    return isinstance(member, discord.Member) and bool(
+        getattr(member, "guild_permissions", None)
+        and member.guild_permissions.administrator
+    )
+
+
+def is_chief_admin(member) -> bool:
+    """Chief Administrator role, or the guild owner (full override tier)."""
+    if not isinstance(member, discord.Member):
+        return False
+    guild = getattr(member, "guild", None)
+    if guild is not None and guild.owner_id == member.id:
+        return True
+    return has_role(member, settings.CHIEF_ADMIN_ROLE)
+
+
+def is_immigration_officer(member) -> bool:
+    return has_role(member, settings.IMMIGRATION_OFFICER_ROLE)
+
+
+def is_unverified(member) -> bool:
+    return has_role(member, settings.UNVERIFIED_ROLE)
+
+
+def is_protected_target(member) -> bool:
+    """Admin / Chief Administrator accounts — only the Chief Admin may
+    register or modify them."""
+    return is_chief_admin(member) or is_discord_admin(member)
+
+
+def can_register(actor, target) -> tuple[bool, str]:
+    """May *actor* run !register against *target*?
+
+    Allowed: Chief Administrator (always), Discord Administrators and
+    Immigration Officers (for non-protected targets).  Protected targets
+    (Admin or Chief Admin) are locked to the Chief Administrator only.
+    """
+    if not isinstance(actor, discord.Member):
+        return False, "You can only run !register from inside a server."
+    if is_protected_target(target):
+        if is_chief_admin(actor):
+            return True, ""
+        return False, (
+            "🛑 **{name}** is a protected account (Admin / Chief Administrator). "
+            "Only the **Chief Administrator** can register or modify them."
+        ).format(name=target)
+    if is_chief_admin(actor) or is_discord_admin(actor) or is_immigration_officer(actor):
+        return True, ""
+    return False, (
+        "Only a server **Administrator**, an **Immigration Officer**, or the "
+        "**Chief Administrator** can run !register."
+    )
+
+
+def can_appoint(actor) -> tuple[bool, str]:
+    """May *actor* run !appoint / !dismiss?
+
+    Allowed: Chief Administrator, Discord Administrators, and holders of
+    any role in ``settings.APPOINT_ALLOWED_ROLES`` (President, Vice
+    President, Chief of Staff).
+    """
+    if not isinstance(actor, discord.Member):
+        return False, "You can only run that command from inside a server."
+    if is_chief_admin(actor) or is_discord_admin(actor):
+        return True, ""
+    for role_name in settings.APPOINT_ALLOWED_ROLES:
+        if has_role(actor, role_name):
+            return True, ""
+    return False, (
+        "Only a server **Administrator**, the **Chief Administrator**, the "
+        "**President**, the **Vice President**, or the **Chief of Staff** can "
+        "run !appoint / !dismiss."
+    )
+
+
+def is_appointment_actor(actor) -> bool:
+    """Boolean-only variant of :func:`can_appoint`."""
+    return can_appoint(actor)[0]
+
+
+# ---------------------------------------------------------------------------
 # Channel-name matching (pure logic)
 # ---------------------------------------------------------------------------
 
@@ -120,8 +214,26 @@ def _normalise(name: str) -> str:
 
 
 def is_arrival_channel(name: str) -> bool:
-    """True if *name* is the #arrival-station channel."""
-    return _normalise(name) == ARRIVAL_CHANNEL_NAME
+    """True if *name* is the #airport channel (legacy: #arrival-station)."""
+    return _normalise(name) in {
+        ARRIVAL_CHANNEL_NAME,
+        settings.AIRPORT_CHANNEL_NAME,
+    }
+
+
+def is_airport_channel(name: str) -> bool:
+    """True for the #airport channel where new arrivals check in."""
+    return is_arrival_channel(name)
+
+
+def is_citizens_channel(name: str) -> bool:
+    """True for the #citizens channel where members post their interest."""
+    return _normalise(name) == settings.CITIZENS_CHANNEL_NAME
+
+
+def is_public_channel(name: str) -> bool:
+    """The ONLY channels visible to Unverified members: #airport + #citizens."""
+    return is_airport_channel(name) or is_citizens_channel(name)
 
 
 def city_of_channel(name: str) -> str | None:
@@ -156,14 +268,12 @@ def is_national_channel(name: str) -> bool:
 
 
 def is_public_info_channel(name: str) -> bool:
-    """True for intentionally public channels (rules, info, general, ...).
+    """True for the channels that stay open to Unverified members.
 
-    Unregistered arrivals keep access to these — the spec only requires
-    that *city* and *government* channels be hidden.
+    Per spec, Unverified members can only see #airport and #citizens —
+    everything else is locked until registration removes the role.
     """
-    name = _normalise(name)
-    return name in {"rules", "info", "information", "general", "announcements",
-                    "welcome", "help", "staff"}
+    return is_public_channel(name)
 
 
 # ---------------------------------------------------------------------------
@@ -204,14 +314,19 @@ def overrides_for_channel(
         "@everyone": _deny_view(),
     }
 
-    if is_arrival_channel(name):
-        # The arrival station is open to everyone (view + send), because
-        # that is where registration happens.
+    if is_public_channel(name):
+        # #airport and #citizens are the only channels visible to Unverified
+        # members, so they stay open to everyone (view + send).
         open_p = Permissions.none()
         open_p.view_channel = True
         open_p.send_messages = True
         overrides["@everyone"] = open_p
         return overrides
+
+    # Everything else is invisible to Unverified members.  The @everyone
+    # deny above already blocks them on city/national channels; this deny
+    # covers channels where @everyone would otherwise have view.
+    overrides[settings.UNVERIFIED_ROLE] = _deny_view()
 
     city = city_of_channel(name)
     if city is not None:
@@ -237,13 +352,18 @@ def overrides_for_category(name: str) -> dict[str, Permissions]:
     lowered = text.lower()
 
     if "national" in lowered or "🇩🇨" in text:
-        return {"@everyone": _deny_view(), DELTAIAN_ROLE_NAME: _allow_view()}
+        return {
+            "@everyone": _deny_view(),
+            settings.UNVERIFIED_ROLE: _deny_view(),
+            DELTAIAN_ROLE_NAME: _allow_view(),
+        }
 
     for city in identity.CITY_PREFIXES:
         city_l = city.lower()
         if city_l in lowered:
             return {
                 "@everyone": _deny_view(),
+                settings.UNVERIFIED_ROLE: _deny_view(),
                 **{role: _allow_view() for role in city_role_names(city)},
             }
     return {}
@@ -264,6 +384,38 @@ async def _ensure_role(guild: Guild, role_name: str, *, reason: str) -> discord.
     if existing is not None:
         return existing
     return await guild.create_role(name=role_name, reason=reason, hoist=False)
+async def ensure_unverified_role(
+    guild: Guild, *, reason: str = "Delta City unverified setup"
+) -> discord.Role:
+    """Find (or create) the Unverified role in *guild*."""
+    return await _ensure_role(guild, settings.UNVERIFIED_ROLE, reason=reason)
+
+
+async def add_unverified_role(
+    member, *, reason: str = "New arrival to Delta City"
+) -> discord.Role | None:
+    """Stamp *member* with the Unverified role (idempotent)."""
+    if not isinstance(member, discord.Member):
+        return None
+    role = _role_by_name(member.guild, settings.UNVERIFIED_ROLE)
+    if role is None:
+        return None
+    if role not in member.roles:
+        await member.add_roles(role, reason=reason)
+    return role
+
+
+async def remove_unverified_role(
+    member, *, reason: str = "Registration complete"
+) -> discord.Role | None:
+    """Strip the Unverified role from *member* (idempotent)."""
+    if not isinstance(member, discord.Member):
+        return None
+    role = _role_by_name(member.guild, settings.UNVERIFIED_ROLE)
+    if role is None or role not in member.roles:
+        return None
+    await member.remove_roles(role, reason=reason)
+    return role
 
 
 async def setup_arrival_permissions(guild: Guild, *, reason: str = "Delta City arrival station setup") -> dict[str, Any]:
