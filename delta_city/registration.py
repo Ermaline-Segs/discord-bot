@@ -1223,16 +1223,12 @@ class ImmigrationCog(commands.Cog):
             await member.send(render_already_registered(existing))
             return
         if self.db.has_active_registration(member.id):
-            return  # already in progress; message already exists
-        expires = (datetime.now(timezone.utc) + timedelta(seconds=REGISTRATION_TIMEOUT)).isoformat()
-        self.db.create_registration_session(
-            member.id, member.guild.id, expires,
-            stage="city",
-            channel_id=member.guild.system_channel.id if member.guild.system_channel else None,
-        )
-        view = ImmigrationView(member.id, self)
+            return  # already in progress; form already exists
         channel = self._channel_for_member(member.guild, member)
         if channel is None:
+            # No visible channel to post the form in — do NOT create a
+            # session row, or the user would be locked out of !arrival
+            # with no form (and no cancel button) to act on.
             try:
                 await member.send(
                     "🛬 WELCOME TO DELTA CITY\n\n"
@@ -1245,7 +1241,37 @@ class ImmigrationCog(commands.Cog):
                     "Could not DM %s (%s) — no visible channel.", member, member.id
                 )
             return
-        await channel.send(content=render_arrival_header(member), view=view)
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=REGISTRATION_TIMEOUT)).isoformat()
+        self.db.create_registration_session(
+            member.id, member.guild.id, expires,
+            stage="city",
+            channel_id=channel.id,
+        )
+        view = ImmigrationView(member.id, self)
+        try:
+            sent = await channel.send(content=render_arrival_header(member), view=view)
+        except discord.HTTPException as exc:
+            # The form never reached the channel — drop the session row so
+            # the next !arrival starts clean instead of blocking on a ghost
+            # session the user can neither see nor cancel.
+            self.db.delete_registration_session(member.id)
+            log.warning(
+                "Could not post registration form for %s (%s) in %s: %s",
+                member, member.id, channel, exc,
+            )
+            try:
+                await member.send(
+                    "🛬 WELCOME TO DELTA CITY\n\n"
+                    "Something went wrong posting my registration form "
+                    "in the server. Try `!arrival` again in a moment, or "
+                    "ping an administrator."
+                )
+            except discord.Forbidden:
+                pass
+            return
+        self.db.update_registration_session(
+            member.id, message_id=sent.id, channel_id=channel.id
+        )
 
     # -- events -------------------------------------------------------------
 
@@ -1295,20 +1321,70 @@ class ImmigrationCog(commands.Cog):
     async def cmd_arrival(self, ctx: commands.Context) -> None:
         """Open the arrival/registration experience (or show progress)."""
         member = ctx.author
-        if isinstance(member, discord.Member) and member.guild:
-            existing = self.db.get_citizen(member.id) if self.db else None
-            if existing is not None:
-                await ctx.reply(render_already_registered(existing))
-                return
-            if self.db and self.db.has_active_registration(member.id):
-                await ctx.reply(
-                    "🛬 You already have a registration in progress. "
-                    "Find my form above — or cancel it and try again."
-                )
-                return
-            await self._start_session(member)
-        else:
+        if not (isinstance(member, discord.Member) and member.guild):
             await ctx.reply("🛬 Registration only works inside a server.")
+            return
+        if self.db is None:
+            await ctx.reply("⚠️ Registration is currently unavailable.")
+            return
+        existing = self.db.get_citizen(member.id)
+        if existing is not None:
+            await ctx.reply(render_already_registered(existing))
+            return
+        session = self.db.get_registration_session(member.id)
+        if session is not None and await self._form_message_alive(member.guild, session):
+            await ctx.reply(
+                "🛬 You already have a registration in progress. "
+                "Find my form above — or run `!cancel_registration` "
+                "to start over."
+            )
+            return
+        if session is not None:
+            # Stale session: the saved form message is gone (deleted, or the
+            # post failed after the row was written). Drop it so the user is
+            # not locked out with no form to interact with or cancel.
+            self.db.delete_registration_session(member.id)
+        await self._start_session(member)
+
+    async def _form_message_alive(
+        self, guild: discord.Guild, session: Mapping[str, Any]
+    ) -> bool:
+        """True if the form message stored in *session* is still fetchable."""
+        message_id = session.get("message_id")
+        channel_id = session.get("channel_id")
+        if not message_id or not channel_id:
+            return False
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            return False
+        try:
+            message = await channel.fetch_message(int(message_id))
+        except discord.HTTPException:
+            return False
+        return message is not None
+
+    @commands.command(name="cancel_registration", aliases=["cancelreg"], hidden=False)
+    async def cmd_cancel_registration(self, ctx: commands.Context) -> None:
+        """Cancel an in-progress registration session."""
+        member = ctx.author
+        if not (isinstance(member, discord.Member) and member.guild):
+            await ctx.reply("⚠️ Cancellation only works inside a server.", ephemeral=True)
+            return
+        if self.db is None:
+            await ctx.reply("⚠️ Registration is currently unavailable.", ephemeral=True)
+            return
+        if self.db.delete_registration_session(member.id):
+            await ctx.reply(
+                "🗑️ Registration cancelled. Use `!arrival` whenever you're "
+                "ready to start again.",
+                ephemeral=True,
+            )
+        else:
+            await ctx.reply(
+                "You don't have a registration in progress. Use `!arrival` "
+                "to start one.",
+                ephemeral=True,
+            )
 
     @commands.command(name="register", hidden=False)
     async def cmd_register(
