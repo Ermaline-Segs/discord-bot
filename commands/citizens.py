@@ -440,6 +440,7 @@ class Citizens(commands.Cog):
             "",
             "**📋 Registration** (everyone)",
             "`!register` — register as a citizen, resident, or visitor",
+            "`!check-in` (alias `!checkin`) — begin the self-service check-in (Asylum role)",
             "`!dchelp` — this command list",
             "",
             "**👤 Citizen registry** (admin)",
@@ -450,6 +451,10 @@ class Citizens(commands.Cog):
             "`!citizens` — full paginated registry",
             "`!move @user <state>` — move a citizen between states",
             "`!stateinfo <state>` — state government + population summary",
+            "",
+            "**🎭 Roles** (Chief Admin / Immigration Officer)",
+            "`!role @user <role>` — assign or remove a role (hidden command)",
+            "`!<role> @user` — shorthand per role, e.g. `!citizen_of_asaba @user`, `!immigration_officer @user`",
         ]
         if not is_admin:
             lines.append("")
