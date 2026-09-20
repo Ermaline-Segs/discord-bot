@@ -497,6 +497,20 @@ async def remove_unverified_role(
     return role
 
 
+async def add_asylum_role(
+    member, *, reason: str = "New arrival at Delta International Airport"
+) -> discord.Role | None:
+    """Stamp *member* with the Asylum role (idempotent)."""
+    if not isinstance(member, discord.Member):
+        return None
+    role = _role_by_name(member.guild, settings.ASYLUM_ROLE)
+    if role is None:
+        return None
+    if role not in member.roles:
+        await member.add_roles(role, reason=reason)
+    return role
+
+
 async def setup_arrival_permissions(guild: Guild, *, reason: str = "Delta City arrival station setup") -> dict[str, Any]:
     """Find or create #arrival-station and open it to everyone.
 

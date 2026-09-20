@@ -42,6 +42,7 @@ EXTENSIONS = (
     "commands.government",
     "delta_city.registration",
     "commands.citizens",
+    "commands.airport",
 )
 
 
