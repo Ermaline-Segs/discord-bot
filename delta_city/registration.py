@@ -25,25 +25,31 @@ Stages: ``city`` -> ``community`` -> ``gender`` -> ``review`` -> done.
 A session only becomes a permanent citizen record after the user
 presses *Confirm* on the review stage; cancel or timeout discards the
 session without creating a record or reserving a number.
+
+Self-service check-in (`!check-in`, Asylum role) leads through the Begin button, a registration modal (character name / DOB / gender / city), a home-state select, and an officer approve/reject that issues the citizen record plus birth certificate.  Staff toggle roles with the hidden `!role` command and per-role shorthand `!RoleName @user` commands registered at cog setup.
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import io
 import logging
+import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping, Optional
 
 import discord
 from discord.ext import commands
 
 from config import settings
+from database.database import DeltaCityDB
 from delta_city import identity
 from delta_city import id_card, portrait
 from delta_city import permissions
 
 log = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # stage model
@@ -855,6 +861,310 @@ def render_citizen_profile(record: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+
+# ---------------------------------------------------------------------------
+# Field limits and persistent interaction ids
+# ---------------------------------------------------------------------------
+
+MAX_NAME_LEN = 100
+MAX_DOB_LEN = 32
+MAX_GENDER_LEN = 50
+MAX_CITY_LEN = 100
+
+# Persistent (survive restarts via bot.add_view) interaction custom ids.
+BEGIN_BUTTON_ID = "dcim:begin"
+CANCEL_RESTART_BUTTON_ID = "dcim:cancel-restart"
+STATE_SELECT_ID = "dcim:state"
+APPROVE_BUTTON_ID = "dcim:approve"
+REJECT_BUTTON_ID = "dcim:reject"
+
+# Transient (per-invocation) interaction ids.
+ROLE_SELECT_ID = "dcim:role"
+
+MODAL_TITLE = "Delta City — Check-In Registration"
+MODAL_PLACEHOLDERS = {
+    "character_name": "Your character's full name",
+    "date_of_birth": "e.g. 12/05/1994",
+    "gender": "e.g. Male / Female / Non-binary",
+    "city": "Your home city on Earth",
+}
+
+PENDING_NOTICE = "You already have an application pending."
+
+
+# ---------------------------------------------------------------------------
+# Errors and pure helpers (no Discord objects required — unit-testable)
+# ---------------------------------------------------------------------------
+
+
+class RegistrationError(Exception):
+    """User-facing validation error for the check-in flow."""
+
+
+def _clean(value: Any, max_len: int) -> str:
+    """Strip, collapse internal whitespace and cap length."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:max_len]
+
+
+def sanitize_modal_fields(
+    character_name: str,
+    date_of_birth: str,
+    gender: str,
+    city: str,
+) -> dict:
+    """Clean the four modal inputs; raise RegistrationError when a
+    required field is empty.  Date of birth is optional and stored as
+    None when blank.  Returns a dict with keys character_name,
+    date_of_birth, gender, city."""
+    name = _clean(character_name, MAX_NAME_LEN)
+    dob = _clean(date_of_birth, MAX_DOB_LEN)
+    gender_clean = _clean(gender, MAX_GENDER_LEN)
+    city_clean = _clean(city, MAX_CITY_LEN)
+
+    missing = []
+    if not name:
+        missing.append("character name")
+    if not gender_clean:
+        missing.append("gender")
+    if not city_clean:
+        missing.append("city")
+    if missing:
+        raise RegistrationError(
+            "Please fill in: " + ", ".join(missing) + "."
+        )
+    return {
+        "character_name": name,
+        "date_of_birth": dob or None,
+        "gender": gender_clean,
+        "city": city_clean,
+    }
+
+
+def certificate_number(state: str, number: int) -> str:
+    """Numbered certificate id: ``DC-<STATE CODE>-0123`` (4 digits)."""
+    code = settings.STATE_CODES[state]
+    return f"DC-{code}-{int(number):04d}"
+
+
+def state_select_options() -> list:
+    """The six home-state options for the state select menu."""
+    return [
+        discord.SelectOption(
+            label=state, value=state, description=f"Home state: {state}"
+        )
+        for state in settings.STATES
+    ]
+
+
+def normalize_role_name(name: str) -> str:
+    """Lowercase letters+digits only: '🇩🇨 Deltaian' -> 'deltaian'."""
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def resolve_shorthand_role(command_name: str, allowed: Iterable[str]) -> Optional[str]:
+    """Resolve a ``!RoleName`` shorthand against the actor's allowed roles.
+
+    Exact (normalised) match first, then a unique normalised prefix of at
+    least 4 characters.  Returns the matched role name or None.
+    """
+    wanted = normalize_role_name(command_name)
+    if not wanted:
+        return None
+    allowed_list = list(allowed)
+    for role_name in allowed_list:
+        if normalize_role_name(role_name) == wanted:
+            return role_name
+    if len(wanted) >= 4:
+        prefix_hits = [
+            r for r in allowed_list if normalize_role_name(r).startswith(wanted)
+        ]
+        if len(prefix_hits) == 1:
+            return prefix_hits[0]
+    return None
+
+
+def command_name_for_role(role_name: str) -> str:
+    """Discord command name for a role's shorthand command:
+    'Citizen of Asaba' -> 'citizen_of_asaba', 'Deltan' -> 'deltan'."""
+    name = re.sub(r"[^a-z0-9]+", "_", str(role_name).lower()).strip("_")
+    return name or "role"
+
+
+# ---------------------------------------------------------------------------
+# Views
+# ---------------------------------------------------------------------------
+
+
+class CheckInView(discord.ui.View):
+    """Persistent 'Begin Registration' button, re-attached on restart."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Begin Registration",
+        custom_id=BEGIN_BUTTON_ID,
+        style=discord.ButtonStyle.primary,
+        emoji="🛂",
+    )
+    async def begin(self, interaction: discord.Interaction, button):
+        cog = interaction.client.get_cog("ImmigrationCog")
+        if cog is None:
+            return
+        await cog._on_begin_pressed(interaction)
+
+
+class PendingNoticeView(discord.ui.View):
+    """'Cancel and start over' button — no dead ends in the flow."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Cancel and start over",
+        custom_id=CANCEL_RESTART_BUTTON_ID,
+        style=discord.ButtonStyle.danger,
+        emoji="↩️",
+    )
+    async def cancel_restart(self, interaction: discord.Interaction, button):
+        cog = interaction.client.get_cog("ImmigrationCog")
+        if cog is None:
+            return
+        await cog._on_cancel_restart_pressed(interaction)
+
+
+class RegistrationModal(discord.ui.Modal):
+    """Step 1: character name, date of birth, gender, city."""
+
+    def __init__(self):
+        super().__init__(title=MODAL_TITLE)
+        self.character_name = discord.ui.TextInput(
+            label="Character Name",
+            custom_id="dcim:name",
+            style=discord.TextStyle.short,
+            max_length=MAX_NAME_LEN,
+            placeholder=MODAL_PLACEHOLDERS["character_name"],
+            required=False,
+        )
+        self.date_of_birth = discord.ui.TextInput(
+            label="Date of Birth",
+            custom_id="dcim:dob",
+            style=discord.TextStyle.short,
+            max_length=MAX_DOB_LEN,
+            placeholder=MODAL_PLACEHOLDERS["date_of_birth"],
+            required=False,
+        )
+        self.gender = discord.ui.TextInput(
+            label="Gender",
+            custom_id="dcim:gender",
+            style=discord.TextStyle.short,
+            max_length=MAX_GENDER_LEN,
+            placeholder=MODAL_PLACEHOLDERS["gender"],
+            required=False,
+        )
+        self.city = discord.ui.TextInput(
+            label="City",
+            custom_id="dcim:city",
+            style=discord.TextStyle.short,
+            max_length=MAX_CITY_LEN,
+            placeholder=MODAL_PLACEHOLDERS["city"],
+            required=False,
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("ImmigrationCog")
+        if cog is None:
+            return
+        await cog._on_modal_submitted(
+            interaction,
+            self.character_name.value or "",
+            self.date_of_birth.value or "",
+            self.gender.value or "",
+            self.city.value or "",
+        )
+
+
+class StateSelectView(discord.ui.View):
+    """Step 2: choose the home state (six states)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.select(
+        custom_id=STATE_SELECT_ID,
+        placeholder="Choose your home state",
+        options=state_select_options(),
+    )
+    async def state_select(self, interaction: discord.Interaction, select):
+        cog = interaction.client.get_cog("ImmigrationCog")
+        if cog is None:
+            return
+        await cog._on_state_selected(interaction, select.values[0])
+
+
+class ApplicationView(discord.ui.View):
+    """Approve / Reject buttons on the application post. Officers only."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Approve",
+        custom_id=APPROVE_BUTTON_ID,
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+    )
+    async def approve(self, interaction: discord.Interaction, button):
+        cog = interaction.client.get_cog("ImmigrationCog")
+        if cog is None:
+            return
+        await cog._on_approve_pressed(interaction)
+
+    @discord.ui.button(
+        label="Reject",
+        custom_id=REJECT_BUTTON_ID,
+        style=discord.ButtonStyle.danger,
+        emoji="❌",
+    )
+    async def reject(self, interaction: discord.Interaction, button):
+        cog = interaction.client.get_cog("ImmigrationCog")
+        if cog is None:
+            return
+        await cog._on_reject_pressed(interaction)
+
+
+class RoleSelectView(discord.ui.View):
+    """!role dropdown — built per-invoker with only allowed roles."""
+
+    def __init__(
+        self,
+        cog: "ImmigrationCog",
+        invoker: discord.Member,
+        target: discord.Member,
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.invoker = invoker
+        self.target = target
+        options = [
+            discord.SelectOption(
+                label=role_name,
+                value=role_name,
+                description="Assign or remove this role",
+            )
+            for role_name in permissions.assignable_role_names(invoker)
+            if role_name
+        ]
+        self.select = discord.ui.Select(
+            custom_id=ROLE_SELECT_ID,
+            placeholder="Choose a role to assign or remove",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.add_item(self.select)
+
+
 # ---------------------------------------------------------------------------
 # Cog — commands + member join hook
 # ---------------------------------------------------------------------------
@@ -867,6 +1177,13 @@ class ImmigrationCog(commands.Cog):
         self.bot = bot
         bot.add_listener(self._on_member_join, "on_member_join")
 
+        # Shared persistent views (survive restarts via bot.add_view).
+        self.check_in_view = CheckInView()
+        self.pending_view = PendingNoticeView()
+        self.application_view = ApplicationView()
+        self.state_view = StateSelectView()
+        self._register_persistent_views()
+        self._register_shorthand_commands()
     # -- helpers ------------------------------------------------------------
 
     @property
@@ -1206,6 +1523,451 @@ class ImmigrationCog(commands.Cog):
         if added:
             changed += 1
         return changed
+
+# -- check-in flow (self-service) --------------------------------------
+
+    @commands.command(name="check-in", aliases=["checkin"])
+    async def cmd_check_in(self, ctx: commands.Context) -> None:
+        """Begin the self-service check-in registration (Asylum role)."""
+        if self.db is None:
+            await ctx.reply("⚠️ The citizen database is unavailable.",
+                            ephemeral=True)
+            return
+        if not permissions.is_asylum(ctx.author):
+            await ctx.reply(
+                "⚠️ Check-in is for members holding the Asylum role.",
+                ephemeral=True,
+            )
+            return
+        citizen = self.db.get_citizen(ctx.author.id)
+        if citizen is not None:
+            await ctx.reply(
+                f"✅ You are already a citizen ({citizen['citizen_id']}).",
+                ephemeral=True,
+            )
+            return
+        existing = self.db.get_pending_application(ctx.author.id)
+        if existing is not None:
+            await ctx.reply(PENDING_NOTICE, view=PendingNoticeView(),
+                            ephemeral=True)
+            return
+        await ctx.reply(
+            "🛆 Welcome to Delta City port. Begin your registration below.",
+            view=CheckInView(),
+        )
+
+    @commands.command(name="role", hidden=True)
+    async def cmd_role(
+        self,
+        ctx: commands.Context,
+        member: Optional[discord.Member] = None,
+    ) -> None:
+        """Show the dropdown of roles the invoker may assign or remove."""
+        if member is None:
+            await ctx.reply(
+                "🛂 Usage: `!role @user` — or use the shorthand "
+                "`!RoleName @user`.",
+                ephemeral=True,
+            )
+            return
+        if not permissions.assignable_role_names(ctx.author):
+            await ctx.reply(
+                "⚠️ You may not assign any Delta City roles.",
+                ephemeral=True,
+            )
+            return
+        await ctx.reply(
+            f"Choose a role for {member.mention}.",
+            view=RoleSelectView(self, ctx.author, member),
+            ephemeral=True,
+        )
+
+    async def _on_begin_pressed(
+        self, interaction: discord.Interaction
+    ) -> None:
+        """Begin button -> open the registration modal."""
+        member = self._member_from(interaction.user)
+        if member is None:
+            await interaction.response.send_message(
+                "⚠️ This works only inside a server.", ephemeral=True
+            )
+            return
+        if self.db is None:
+            await interaction.response.send_message(
+                "⚠️ The citizen database is unavailable.", ephemeral=True
+            )
+            return
+        if not permissions.is_asylum(member):
+            await interaction.response.send_message(
+                "⚠️ Check-in is for members holding the Asylum role.",
+                ephemeral=True,
+            )
+            return
+        citizen = self.db.get_citizen(member.id)
+        if citizen is not None:
+            await interaction.response.send_message(
+                f"✅ You are already a citizen ({citizen['citizen_id']}).",
+                ephemeral=True,
+            )
+            return
+        if self.db.get_pending_application(member.id) is not None:
+            await interaction.response.send_message(
+                PENDING_NOTICE, view=PendingNoticeView(), ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(RegistrationModal())
+
+    async def _on_cancel_restart_pressed(
+        self, interaction: discord.Interaction
+    ) -> None:
+        """'Cancel and start over' -> clear the pending row, fresh form."""
+        member = self._member_from(interaction.user)
+        if member is None:
+            return
+        if self.db is not None:
+            self.db.delete_application(member.id)
+        try:
+            await interaction.response.edit_message(
+                "🛆 Start again when you are ready.", view=CheckInView()
+            )
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "🛆 Start again when you are ready.",
+                view=CheckInView(),
+                ephemeral=True,
+            )
+
+    async def _on_modal_submitted(
+        self,
+        interaction: discord.Interaction,
+        character_name: str,
+        date_of_birth: str,
+        gender: str,
+        city: str,
+    ) -> None:
+        """Modal step 1 -> validate, persist, then ask for the home state."""
+        member = self._member_from(interaction.user)
+        if member is None:
+            await interaction.response.send_message(
+                "⚠️ This works only inside a server.", ephemeral=True
+            )
+            return
+        try:
+            fields = sanitize_modal_fields(
+                character_name, date_of_birth, gender, city
+            )
+        except RegistrationError as exc:
+            await interaction.response.send_message(
+                f"⚠️ {exc}", ephemeral=True
+            )
+            return
+        if self.db is None:
+            await interaction.response.send_message(
+                "⚠️ The citizen database is unavailable.", ephemeral=True
+            )
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.HTTPException:
+            pass
+        self.db.create_application(
+            member.id,
+            interaction.guild_id,
+            fields["character_name"],
+            fields["date_of_birth"],
+            fields["gender"],
+            fields["city"],
+        )
+        await interaction.followup.send(
+            "🛂 Almost there — choose your home state.",
+            view=StateSelectView(),
+            ephemeral=True,
+        )
+
+    async def _on_state_selected(
+        self, interaction: discord.Interaction
+    ) -> None:
+        """State select step 2 -> save the state and post the application."""
+        member = self._member_from(interaction.user)
+        if member is None:
+            await interaction.response.defer(ephemeral=True)
+            return
+        if self.db is None:
+            await interaction.response.send_message(
+                "⚠️ The citizen database is unavailable.", ephemeral=True
+            )
+            return
+        state = interaction.data["values"][0]
+        pending = self.db.get_pending_application(member.id)
+        if pending is None:
+            await interaction.response.send_message(
+                "⚠️ No application in progress — run `!check-in` to start.",
+                ephemeral=True,
+            )
+            return
+        self.db.update_application_state(member.id, state)
+        pending = self.db.get_pending_application(member.id)
+        guild = member.guild
+        office = self._office_channel(guild)
+        lines = [
+            f"🛂 **New application** from {member.mention}",
+            f"📛 Character name: {pending['character_name']}",
+            f"🎂 Date of birth: {pending['date_of_birth'] or '—'}",
+            f"⚧ Gender: {pending['gender']}",
+            f"🏙️ City: {pending['city']}",
+            f"🗺️ Home state: {state}",
+        ]
+        if office is not None:
+            await office.send(
+                "\n".join(lines), view=ApplicationView(self, member.id)
+            )
+        await interaction.response.send_message(
+            "✅ Application submitted. An officer will review it in "
+            "the immigration office.",
+            ephemeral=True,
+        )
+
+    async def _on_approve_pressed(
+        self, interaction: discord.Interaction
+    ) -> None:
+        """Approve -> issue the citizen, swap roles, post the certificate."""
+        user_id = int(interaction.data["component_id"].rsplit(":", 1)[1])
+        if not (
+            permissions.is_immigration_officer(interaction.user)
+            or permissions.is_chief_admin(interaction.user)
+        ):
+            await interaction.response.send_message(
+                "⚠️ Only officers may approve applications.",
+                ephemeral=True,
+            )
+            return
+        if self.db is None:
+            await interaction.response.send_message(
+                "⚠️ The citizen database is unavailable.", ephemeral=True
+            )
+            return
+        pending = self.db.get_pending_application(user_id)
+        if pending is None:
+            await interaction.response.edit_message(
+                content="⚠️ No pending application for that member.",
+                view=None,
+            )
+            return
+        await interaction.response.defer()
+        guild = interaction.guild
+        state = pending["state"]
+        if not state:
+            await interaction.followup.send(
+                "⚠️ The application has no home state recorded.",
+                ephemeral=True,
+            )
+            await interaction.edit_original_response(
+                content="⚠️ **Cannot approve** — no home state recorded.",
+                view=None,
+            )
+            return
+        try:
+            record, created = self.db.register_citizen(
+                user_id,
+                name=pending["character_name"],
+                gender=pending["gender"],
+                state=state,
+                date_of_birth=pending["date_of_birth"],
+            )
+        except ValueError as exc:
+            await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+            return
+        if not created:
+            await interaction.followup.send(
+                f"✅ That member is already a citizen "
+                f"({record['citizen_id']}).",
+                ephemeral=True,
+            )
+            await interaction.edit_original_response(
+                content="✅ **Approved** (member was already a citizen).",
+                view=None,
+            )
+            return
+        self.db.set_application_status(user_id, "approved")
+        member = guild.get_member(user_id)
+        if member is not None:
+            await self._apply_role_change(
+                interaction.user, member, settings.CITIZEN_ROLE_NAME
+            )
+            await self._apply_role_change(
+                interaction.user, member, f"{state} Citizen"
+            )
+        certificate = record["citizen_id"]
+        lines = [
+            f"📜 **Birth certificate {certificate}**",
+            f"📛 {record['name']}",
+            f"🎂 {record['date_of_birth'] or '—'}",
+            f"⚧ {record['gender']}",
+            f"🏙️ {pending['city']}, {state}",
+        ]
+        cert_channel = self._certificate_channel(guild)
+        if cert_channel is not None:
+            await cert_channel.send("\n".join(lines))
+        if member is not None:
+            lines2 = [
+                f"🛬 **{member.mention}** has become a Deltaian citizen: "
+                f"**{record['name']}** ({certificate})."
+            ]
+            ee = self._entry_exit_channel(guild)
+            if ee is not None:
+                await ee.send("\n".join(lines2))
+        await interaction.edit_original_response(
+            content=f"✅ **Approved** — {certificate} issued.",
+            view=None,
+        )
+
+    async def _on_reject_pressed(
+        self, interaction: discord.Interaction
+    ) -> None:
+        """Reject -> notify the applicant and clear the pending row."""
+        user_id = int(interaction.data["component_id"].rsplit(":", 1)[1])
+        if not (
+            permissions.is_immigration_officer(interaction.user)
+            or permissions.is_chief_admin(interaction.user)
+        ):
+            await interaction.response.send_message(
+                "⚠️ Only officers may reject applications.",
+                ephemeral=True,
+            )
+            return
+        if self.db is None:
+            await interaction.response.send_message(
+                "⚠️ The citizen database is unavailable.", ephemeral=True
+            )
+            return
+        pending = self.db.get_pending_application(user_id)
+        if pending is None:
+            await interaction.response.edit_message(
+                content="⚠️ No pending application for that member.",
+                view=None,
+            )
+            return
+        self.db.delete_application(user_id)
+        member = interaction.guild.get_member(user_id) if interaction.guild else None
+        if member is not None:
+            try:
+                await member.send(
+                    "⚠️ Your Delta City application was not approved. "
+                    "You may run `!check-in` to try again."
+                )
+            except discord.HTTPException:
+                pass
+        await interaction.edit_original_response(
+            content="❌ **Rejected**.",
+            view=None,
+        )
+
+    async def _apply_role_change(
+        self, invoker, target: discord.Member, role_name: str
+    ) -> None:
+        """Assign or remove a role on the target (idempotent toggle)."""
+        role = None
+        for r in target.guild.roles:
+            if r.name == role_name:
+                role = r
+                break
+        if role is None:
+            log.warning(
+                "Role %r not found in guild %s", role_name, target.guild.id
+            )
+            return
+        try:
+            if role in target.roles:
+                await target.remove_roles(
+                    role, reason=f"Removed by {invoker} (Delta City)"
+                )
+            else:
+                await target.add_roles(
+                    role, reason=f"Assigned by {invoker} (Delta City)"
+                )
+        except discord.Forbidden:
+            log.warning("Missing permission to change role %s", role_name)    # -- setup helpers ---------------------------------------------------------
+
+    def _register_persistent_views(self):
+        add = getattr(self.bot, "add_view", None)
+        if not callable(add):
+            return
+        for view in (
+            self.check_in_view,
+            self.pending_view,
+            self.application_view,
+            self.state_view,
+        ):
+            try:
+                add(view)
+            except Exception as exc:  # pragma: no cover - mock bots
+                log.warning("Could not register persistent view: %s", exc)
+
+    def _register_shorthand_commands(self):
+        """Register !RoleName shorthand commands for every assignable role.
+
+        Skips names that are taken by existing commands (e.g. 'citizen')
+        and names that are not valid Discord command names.
+        """
+        add = getattr(self.bot, "add_command", None)
+        if not callable(add):
+            return
+        for role_name in permissions.assignable_role_names(
+            self._chief_actor_stub()
+        ):
+            cmd_name = command_name_for_role(role_name)
+            if not re.fullmatch(r"[a-z0-9_]{1,32}", cmd_name):
+                continue
+            if getattr(self.bot, "get_command", None) and self.bot.get_command(
+                cmd_name
+            ):
+                continue
+            cmd = commands.command(
+                name=cmd_name,
+            )(
+                self._make_shorthand_command(role_name)
+            )
+            try:
+                add(cmd)
+            except Exception as exc:  # pragma: no cover - duplicate guard
+                log.warning("Could not register shorthand !%s: %s", cmd_name, exc)
+
+    def _chief_actor_stub(self):
+        """A stand-in actor that is treated as Chief Administrator so the
+        full assignable-role list is returned for command registration."""
+
+        class _Stub:
+            @property
+            def roles(self):
+                return [type("_Role", (), {"name": settings.CHIEF_ADMIN_ROLE})()]
+
+            @property
+            def guild(self):
+                class _G:
+                    owner_id = None
+
+                return _G()
+
+            guild_permissions = None
+
+        return _Stub()
+
+    def _make_shorthand_command(self, role_name: str):
+        async def _shorthand(ctx: commands.Context, *, member: Optional[discord.Member] = None):
+            if member is None:
+                await ctx.reply(
+                    f"Usage: `!{role_name} @user` — assign or remove the "
+                    f"{role_name} role.",
+                    ephemeral=True,
+                )
+                return
+            ok, reason = permissions.can_assign_role(ctx.author, member, role_name)
+            if not ok:
+                await ctx.reply(f"⚠️ {reason}", ephemeral=True)
+                return
+            await self._apply_role_change(ctx.author, member, role_name)
+
+        return _shorthand
 
 
 async def setup(bot: commands.Bot) -> None:

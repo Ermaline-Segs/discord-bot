@@ -107,6 +107,24 @@ class DeltaCityDB:
                     updated_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS citizen_applications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    discord_id TEXT UNIQUE NOT NULL,
+                    guild_id TEXT NOT NULL,
+                    character_name TEXT NOT NULL,
+                    date_of_birth TEXT,
+                    gender TEXT,
+                    city TEXT,
+                    state TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    message_id TEXT,
+                    channel_id TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_applications_status
+                    ON citizen_applications(status);
                 """
             )
             self._ensure_registered_state()
@@ -142,6 +160,7 @@ class DeltaCityDB:
     _CITIZEN_COLUMNS = (
         ("community", "TEXT"),
         ("nationality", "TEXT DEFAULT 'Deltaian'"),
+        ("date_of_birth", "TEXT"),
         ("portrait_path", "TEXT"),
         ("id_card_path", "TEXT"),
         ("residence", "TEXT"),
@@ -231,6 +250,7 @@ class DeltaCityDB:
         status: str = "Citizen",
         community: str | None = None,
         nationality: str = "Deltaian",
+        date_of_birth: str | None = None,
     ) -> tuple:
         """Create a citizen profile and return (row_dict, created: bool).
 
@@ -242,6 +262,8 @@ class DeltaCityDB:
         selected city (e.g. "Anioma", "Urhobo"); ``Pidgin`` is stored
         verbatim as a linguistic community, never labelled as a tribe.
         ``nationality`` defaults to the fictional "Deltaian" nationality.
+        ``date_of_birth`` is the character's date of birth from the
+        check-in application (free text, stored verbatim).
         """
         if state not in STATE_CODES:
             raise ValueError(f"Unknown state: {state}")
@@ -256,8 +278,8 @@ class DeltaCityDB:
                 self._conn.execute(
                     "INSERT INTO citizens (discord_id, citizen_id, name, gender, "
                     "registered_state, state, status, community, nationality, "
-                    "joined_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "date_of_birth, joined_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         str(int(discord_id)),
                         citizen_id,
@@ -268,6 +290,7 @@ class DeltaCityDB:
                         status,
                         community,
                         nationality,
+                        date_of_birth,
                         now,
                         now,
                     ),
@@ -692,6 +715,114 @@ class DeltaCityDB:
                 (now,),
             )
             return cur.rowcount
+
+    def clear_registration_sessions(self) -> int:
+        """Drop ALL registration sessions, including any pointing at a
+        posted form message. Called on startup so registration never
+        depends on a stored session. Returns how many were cleared."""
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM registration_sessions")
+            return cur.rowcount
+
+    # ---- citizen applications (check-in flow) ----
+
+    def create_application(
+        self,
+        discord_id,
+        guild_id,
+        character_name: str,
+        date_of_birth: str | None,
+        gender: str,
+        city: str,
+    ) -> dict:
+        """Create (or replace) the pending check-in application for a user."""
+        now = _now()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM citizen_applications WHERE discord_id = ?",
+                (str(int(discord_id)),),
+            )
+            self._conn.execute(
+                "INSERT INTO citizen_applications "
+                "(discord_id, guild_id, character_name, date_of_birth, "
+                "gender, city, state, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    str(int(discord_id)),
+                    str(int(guild_id)),
+                    character_name,
+                    date_of_birth,
+                    gender,
+                    city,
+                    None,
+                    now,
+                    now,
+                ),
+            )
+        return self.get_application(discord_id)
+
+    def get_application(self, discord_id):
+        """Return the latest application dict for a user, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM citizen_applications WHERE discord_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (str(int(discord_id)),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_pending_application(self, discord_id):
+        """Return the user's pending application, or None."""
+        app = self.get_application(discord_id)
+        if app and app["status"] == "pending":
+            return app
+        return None
+
+    def update_application_state(self, discord_id, state: str) -> dict:
+        """Set the home state on a pending application."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE citizen_applications SET state = ?, updated_at = ? "
+                "WHERE discord_id = ? AND status = 'pending'",
+                (state, _now(), str(int(discord_id))),
+            )
+        return self.get_application(discord_id)
+
+    def mark_application_message(
+        self, discord_id, message_id, channel_id
+    ) -> None:
+        """Remember where the application was posted in immigration-office."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE citizen_applications SET message_id = ?, "
+                "channel_id = ?, updated_at = ? "
+                "WHERE discord_id = ? AND status = 'pending'",
+                (
+                    str(int(message_id)),
+                    str(int(channel_id)),
+                    _now(),
+                    str(int(discord_id)),
+                ),
+            )
+
+    def set_application_status(self, discord_id, status: str) -> dict | None:
+        """Move an application to 'approved' or 'rejected'."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE citizen_applications SET status = ?, updated_at = ? "
+                "WHERE discord_id = ?",
+                (status, _now(), str(int(discord_id))),
+            )
+        return self.get_application(discord_id)
+
+    def delete_application(self, discord_id) -> bool:
+        """Delete the user's application. True if one existed."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM citizen_applications WHERE discord_id = ?",
+                (str(int(discord_id)),),
+            )
+            return cur.rowcount > 0
 
     # ---- lifecycle ----
 

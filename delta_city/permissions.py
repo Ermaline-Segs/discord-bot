@@ -110,6 +110,17 @@ def find_city_role(guild: Guild, city: str) -> discord.Role | None:
     return None
 
 
+def state_citizen_role_name(state: str) -> str:
+    """Home-state role handed out on approval, e.g. ``"Citizen of Asaba"``.
+
+    Raises ``KeyError`` for unknown states — callers must validate the
+    state against ``settings.STATES`` first.
+    """
+    if state not in identity.CITY_PREFIXES:
+        raise KeyError(f"Unknown state: {state}")
+    return f"{settings.CITIZEN_ROLE_NAME} of {state}"
+
+
 # ---------------------------------------------------------------------------
 # Permission tiers (pure logic — testable without a guild)
 # ---------------------------------------------------------------------------
@@ -176,6 +187,74 @@ def can_register(actor, target) -> tuple[bool, str]:
         "Only a server **Administrator**, an **Immigration Officer**, or the "
         "**Chief Administrator** can run !register."
     )
+
+
+def is_asylum(member) -> bool:
+    """Holds the Asylum entry role (pre-approval)."""
+    return has_role(member, settings.ASYLUM_ROLE)
+
+
+def is_citizen(member) -> bool:
+    """Holds the national Citizen role (post-approval)."""
+    return has_role(member, settings.CITIZEN_ROLE_NAME)
+
+
+def assignable_role_names(actor) -> list[str]:
+    """Roles *actor* may assign or remove via !role, in display order.
+
+    Chief Administrator (or guild owner) may assign everything.
+    Immigration Officers may assign Citizen and home-state roles.
+    """
+    if is_chief_admin(actor):
+        return (
+            [settings.CITIZEN_ROLE_NAME]
+            + [state_citizen_role_name(s) for s in settings.STATES]
+            + [
+                settings.IMMIGRATION_OFFICER_ROLE,
+                settings.CHIEF_ADMIN_ROLE,
+            ]
+        )
+    if is_immigration_officer(actor):
+        return (
+            [settings.CITIZEN_ROLE_NAME]
+            + [state_citizen_role_name(s) for s in settings.STATES]
+        )
+    return []
+
+
+def can_assign_role(actor, target, role_name: str) -> tuple[bool, str]:
+    """May *actor* assign/remove *role_name* on *target*?
+
+    Protected targets (Admin / Chief Admin) can only be modified by the
+    Chief Administrator (or guild owner), matching the existing
+    protected-target rule.
+    """
+    if not isinstance(actor, discord.Member):
+        return False, "You can only run !role from inside a server."
+    if is_protected_target(target):
+        if is_chief_admin(actor):
+            return True, ""
+        return False, (
+            "🛑 **{name}** is a protected account (Admin / Chief Administrator). "
+            "Only the **Chief Administrator** (or the server owner) can modify them."
+        ).format(name=target)
+    allowed = assignable_role_names(actor)
+    if role_name in allowed:
+        return True, ""
+    if is_immigration_officer(actor) or is_chief_admin(actor):
+        return False, (
+            f"You are not allowed to assign **{role_name}**."
+        )
+    return False, "You are not authorized."
+
+
+def can_use_role_command(actor) -> tuple[bool, str]:
+    """Gate for the !role command itself."""
+    if not isinstance(actor, discord.Member):
+        return False, "You can only run !role from inside a server."
+    if is_chief_admin(actor) or is_immigration_officer(actor):
+        return True, ""
+    return False, "You are not authorized."
 
 
 def can_appoint(actor) -> tuple[bool, str]:

@@ -122,6 +122,18 @@ IMMIGRATION_OFFICER_ROLE = "Immigration Officer"
 # see only #airport and #citizens. Removed when registration completes.
 UNVERIFIED_ROLE = "Unverified"
 
+# Entry status role: stamped on every new member by on_member_join and held
+# until the member's check-in application is approved. The ONLY role that
+# may run !check-in (the self-service entry command).
+ASYLUM_ROLE = "Asylum"
+
+# National citizen role swapped in for Asylum when an application is
+# approved. Every registered citizen holds it.
+CITIZEN_ROLE_NAME = "Citizen"
+
+# Home-state role handed out on approval, e.g. "Citizen of Asaba".
+# See delta_city.permissions.state_citizen_role_name.
+
 # Roles (beyond Discord Administrators and the Chief Administrator) that may
 # run !appoint / !dismiss.
 APPOINT_ALLOWED_ROLES = ["President", "Vice President", "Chief of Staff"]
@@ -130,6 +142,11 @@ APPOINT_ALLOWED_ROLES = ["President", "Vice President", "Chief of Staff"]
 # @everyone until registration removes the Unverified role.
 AIRPORT_CHANNEL_NAME = "airport"
 CITIZENS_CHANNEL_NAME = "citizens"
+
+# Official government channels (created/found by channel name).
+BIRTH_CERTIFICATE_CHANNEL_NAME = "birth-certificate"
+ENTRY_AND_EXIT_CHANNEL_NAME = "entry-and-exit"
+IMMIGRATION_OFFICE_CHANNEL_NAME = "immigration-office"
 
 # Tribal name pools live in delta_city/identity.py (NAME_POOLS, per community);
 # they are the source of truth for auto-generated citizen names.
