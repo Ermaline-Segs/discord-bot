@@ -34,6 +34,26 @@ WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID", "")
 # Where the SQLite database file lives.
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/delta_city.db")
 
+# ---- airport (join/leave flight announcements) -----------------------------
+# Channel where flight-style join/leave announcements are posted
+# (#delta-international-airport). Leave empty to disable airport posts.
+# TODO: paste the channel ID here, or set AIRPORT_CHANNEL_ID in .env.
+AIRPORT_CHANNEL_ID = os.getenv("AIRPORT_CHANNEL_ID", "")
+
+# Channel holding the city regulations, referenced in the arrival message.
+RULES_CHANNEL_ID = os.getenv("RULES_CHANNEL_ID", "1550810323181633576")
+
+# Channel where new arrivals apply for citizenship, referenced in the
+# arrival message.
+CITIZENSHIP_CHANNEL_ID = os.getenv(
+    "CITIZENSHIP_CHANNEL_ID", "1550783870025338921"
+)
+
+# Role pinged when a new arrival lands, asking an officer to clear them.
+IMMIGRATION_OFFICER_ROLE_ID = os.getenv(
+    "IMMIGRATION_OFFICER_ROLE_ID", "1550831141555273809"
+)
+
 # ---- the fictional nation --------------------------------------------------
 NATION_NAME = "DELTA CITY"
 NATION_CODE = "DC"  # prefix of every citizen ID: DC-ASB-0001
