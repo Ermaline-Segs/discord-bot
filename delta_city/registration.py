@@ -1315,48 +1315,12 @@ class ImmigrationCog(commands.Cog):
     # -- events -------------------------------------------------------------
 
     async def _on_member_join(self, member: discord.Member) -> None:
-        """Announce the arrival and begin registration in #arrival-station."""
+        """Stamp Asylum and post the airport arrival announcement."""
         log.info("Member joined: %s (%s)", member, member.id)
         if member.bot:
             return
         await self._stamp_asylum_role(member)
         await self._announce_airport_arrival(member)
-        if self.db is None:
-            return
-        existing = self.db.get_citizen(member.id)
-        if existing is not None:
-            # Returning citizen — welcome them back, no second identity.
-            try:
-                await member.send(
-                    "🇩🇨 Welcome back, **%s**.\n\nCitizen ID: `%s`"
-                    % (existing["name"], existing["citizen_id"])
-                )
-            except discord.Forbidden:
-                pass
-            return
-        # Stamp Unverified — locks the newcomer to #airport and #citizens
-        # until an officer completes their registration.
-        try:
-            await permissions.add_unverified_role(member)
-        except discord.HTTPException as exc:
-            log.warning("Could not stamp Unverified on %s: %s", member, exc)
-        channel = self._arrival_channel(member.guild)
-        if channel is not None:
-            embed = discord.Embed(
-                title="🛬 NEW ARRIVAL",
-                description=(
-                    "A new arrival has entered Delta City.\n\n"
-                    "Citizen registration is required before entry into "
-                    "the city can be granted."
-                ),
-                color=discord.Color.blurple(),
-            )
-            embed.set_footer(text=f"Arrival: {member.display_name}")
-            await channel.send(
-                f"{member.mention} — a new arrival has entered Delta City.",
-                embed=embed,
-            )
-        await self._start_session(member)
 
     # -- airport flight announcements ---------------------------------------
 
@@ -1441,7 +1405,8 @@ class ImmigrationCog(commands.Cog):
 
     # -- commands -----------------------------------------------------------
 
-    @commands.command(name="arrival", hidden=False)
+    # !arrival is retired (the self-service !check-in flow replaces it); the
+    # command object is re-attached after the class is created, below.
     async def cmd_arrival(self, ctx: commands.Context) -> None:
         """Open the arrival/registration experience (or show progress)."""
         member = ctx.author
@@ -2168,6 +2133,16 @@ class ImmigrationCog(commands.Cog):
             await self._apply_role_change(ctx.author, member, role_name)
 
         return _shorthand
+
+
+# !arrival is retired in favour of the self-service !check-in flow. The
+# Command object is re-attached *after* CogMeta has collected
+# ``__cog_commands__`` for the class, so the bot never registers the
+# command while ``cog.cmd_arrival.callback`` still resolves for existing
+# tests and tooling.
+ImmigrationCog.cmd_arrival = commands.command(name="arrival", hidden=False)(
+    ImmigrationCog.__dict__["cmd_arrival"]
+)
 
 
 async def setup(bot: commands.Bot) -> None:

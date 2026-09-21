@@ -8,7 +8,7 @@ else lives in its own module:
     config/settings.py       -> names, states, roles, env vars
     database/database.py     -> SQLite citizen registry + audit log
     commands/government.py   -> !appoint, !dismiss, !government
-    delta_city/registration.py -> !arrival, !register, !id (immigration flow)
+    delta_city/registration.py -> !check-in, !register, !id (immigration flow)
     commands/citizens.py     -> !citizen, !citizens, !move, !stateinfo, !dchelp
     utils/helpers.py         -> shared formatters and role helpers
 
@@ -63,12 +63,12 @@ class DeltaCityBot(commands.Bot):
         log.info("Logged in as %s (ID %s)", self.user, self.user.id)
 
     async def on_member_join(self, member: discord.Member):
-        """Announce the arrival and start the immigration flow.
+        """Announce the arrival and stamp Asylum.
 
-        The immigration cog owns the whole arrival experience (announce in
-        #arrival-station, run the city/community/gender steps, issue the
-        identity). Delegate to it when it is loaded; fall back to the old
-        welcome message if it failed to load so no join goes unhandled.
+        The immigration cog owns the whole arrival experience (stamps the
+        Asylum role and posts the airport announcement). Delegate to it when
+        it is loaded; fall back to a simple welcome if it failed to load so
+        no join goes unhandled.
         """
         log.info("Member joined: %s (%s)", member, member.id)
         cog = self.get_cog("ImmigrationCog")
