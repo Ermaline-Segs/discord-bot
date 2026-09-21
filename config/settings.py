@@ -31,6 +31,22 @@ REGISTRATION_CHANNEL_ID = os.getenv("REGISTRATION_CHANNEL_ID", "")
 # Leave empty to only send the welcome via DM.
 WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID", "")
 
+# Flight-style join/leave announcements (Delta International Airport).
+# Channel that receives arrival and departure announcements.
+AIRPORT_CHANNEL_ID = "1550786898627395624"
+
+# Role stamped on every new member by on_member_join (entry status).
+ASYLUM_ROLE_ID = "1550851264391286864"
+
+# Channel holding the city regulations, linked from the arrival message.
+RULES_CHANNEL_ID = "1550810323181633576"
+
+# Channel where citizenship applications open, linked from the arrival message.
+CITIZENSHIP_CHANNEL_ID = "1550783870025338921"
+
+# Role pinged in the arrival message so an officer can process the newcomer.
+IMMIGRATION_OFFICER_ROLE_ID = "1550831141555273809"
+
 # Where the SQLite database file lives.
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/delta_city.db")
 

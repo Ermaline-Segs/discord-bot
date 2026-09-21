@@ -314,6 +314,44 @@ def render_already_registered(citizen: Mapping[str, Any]) -> str:
     )
 
 
+def build_arrival_message(
+    user_mention: str,
+    year: int,
+    rules_channel_id: str,
+    citizenship_channel_id: str,
+    officer_role_id: str,
+) -> str:
+    """Flight-style arrival announcement posted in the airport channel."""
+    return (
+        "✈️ **FLIGHT ARRIVAL: NOW LANDING IN DELTA CITY**\n\n"
+        f"Please welcome {user_mention}! 🎉\n"
+        f"Flight **DC-{year}** has touched down at Delta International Airport.\n\n"
+        "🏙️ **WELCOME TO THE CITY OF LIFE!**\n\n"
+        "You're not through the gates just yet. Before you step out into "
+        "the Metropolis, complete your arrival checklist:\n\n"
+        f"**1.** Read the city regulations in <#{rules_channel_id}>\n"
+        f"**2.** Apply for citizenship in <#{citizenship_channel_id}> "
+        "with `!check-in`\n"
+        "**3.** Wait at arrivals for an immigration officer to clear you\n\n"
+        "🛂 **Status:** Asylum, awaiting clearance\n\n"
+        "Mind your luggage, watch your step, and enjoy your stay in DC.\n\n"
+        f"<@&{officer_role_id}> a new arrival is waiting. Please direct "
+        "them through immigration when you get a moment."
+    )
+
+
+def build_departure_message(name: str) -> str:
+    """Flight-style departure announcement; name is escaped plain text."""
+    safe_name = discord.utils.escape_mentions(discord.utils.escape_markdown(name))
+    return (
+        "🛫 **FLIGHT DEPARTURE: NOW BOARDING OUT OF DELTA CITY**\n\n"
+        f"{safe_name} has boarded an exit flight and left Delta City.\n\n"
+        "Thank you for spending time in the City of Life. The runway is "
+        "always open if you decide to come back. 🏙️\n\n"
+        "Safe travels, you'll be missed 🥺"
+    )
+
+
 def render_session_expired() -> str:
     """Copy for a stale/abandoned session; invites a fresh start."""
     return (
@@ -1176,6 +1214,7 @@ class ImmigrationCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         bot.add_listener(self._on_member_join, "on_member_join")
+        bot.add_listener(self._on_member_leave, "on_member_remove")
 
         # Shared persistent views (survive restarts via bot.add_view).
         self.check_in_view = CheckInView()
@@ -1278,6 +1317,10 @@ class ImmigrationCog(commands.Cog):
     async def _on_member_join(self, member: discord.Member) -> None:
         """Announce the arrival and begin registration in #arrival-station."""
         log.info("Member joined: %s (%s)", member, member.id)
+        if member.bot:
+            return
+        await self._stamp_asylum_role(member)
+        await self._announce_airport_arrival(member)
         if self.db is None:
             return
         existing = self.db.get_citizen(member.id)
@@ -1314,6 +1357,87 @@ class ImmigrationCog(commands.Cog):
                 embed=embed,
             )
         await self._start_session(member)
+
+    # -- airport flight announcements ---------------------------------------
+
+    def _airport_channel(self, guild):
+        """Delta International Airport channel from config, if present."""
+        if guild is None or not settings.AIRPORT_CHANNEL_ID:
+            return None
+        return guild.get_channel(int(settings.AIRPORT_CHANNEL_ID))
+
+    async def _stamp_asylum_role(self, member: discord.Member) -> None:
+        """Stamp the Asylum role (idempotent); never blocks the join flow."""
+        role = discord.utils.get(
+            member.guild.roles, id=int(settings.ASYLUM_ROLE_ID)
+        )
+        if role is None:
+            log.warning(
+                "Asylum role %s not found in guild; not stamped.",
+                settings.ASYLUM_ROLE_ID,
+            )
+            return
+        if role not in member.roles:
+            try:
+                await member.add_roles(role, reason="New arrival to Delta City (Asylum)")
+            except discord.HTTPException as exc:
+                log.warning("Could not stamp Asylum on %s: %s", member, exc)
+
+    async def _announce_airport_arrival(self, member: discord.Member) -> None:
+        """Post the flight-arrival announcement in the airport channel."""
+        channel = self._airport_channel(member.guild)
+        if channel is None:
+            log.warning(
+                "Airport channel %s not found; skipping arrival announcement.",
+                settings.AIRPORT_CHANNEL_ID,
+            )
+            return
+        message = build_arrival_message(
+            member.mention,
+            _dt.datetime.now().year,
+            settings.RULES_CHANNEL_ID,
+            settings.CITIZENSHIP_CHANNEL_ID,
+            settings.IMMIGRATION_OFFICER_ROLE_ID,
+        )
+        allowed = discord.AllowedMentions(
+            everyone=False,
+            roles=[int(settings.IMMIGRATION_OFFICER_ROLE_ID)],
+            users=[member.id],
+        )
+        try:
+            await channel.send(message, allowed_mentions=allowed)
+        except discord.HTTPException as exc:
+            log.warning(
+                "Could not post arrival announcement in the airport channel: %s",
+                exc,
+            )
+
+    async def _on_member_leave(self, member) -> None:
+        """Post the flight-departure announcement in the airport channel."""
+        log.info("Member left: %s (%s)", member, member.id)
+        if getattr(member, "bot", False):
+            return
+        channel = self._airport_channel(getattr(member, "guild", None))
+        if channel is None:
+            log.warning(
+                "Airport channel %s not found; skipping departure announcement.",
+                settings.AIRPORT_CHANNEL_ID,
+            )
+            return
+        name = getattr(member, "display_name", None) or str(member)
+        message = build_departure_message(name)
+        try:
+            await channel.send(
+                message,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False, users=False
+                ),
+            )
+        except discord.HTTPException as exc:
+            log.warning(
+                "Could not post departure announcement in the airport channel: %s",
+                exc,
+            )
 
     # -- commands -----------------------------------------------------------
 
