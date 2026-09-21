@@ -10,6 +10,7 @@ using lightweight stand-ins (same pattern as test_permissions.py).
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -674,3 +675,40 @@ class TestArrivalSelfHealing:
         db.delete_registration_session.assert_called_once_with(13)
         db.update_registration_session.assert_not_called()
         member.send.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Airport flight announcements (join / leave)
+# ---------------------------------------------------------------------------
+
+
+class TestAirportAnnouncements:
+    def test_arrival_message_substitutes_placeholders_and_year(self):
+        message = reg.build_arrival_message(
+            "<@42>", 2026, "111", "222", "333"
+        )
+        assert "✈️ **FLIGHT ARRIVAL: NOW LANDING IN DELTA CITY**" in message
+        assert "Please welcome <@42>! 🎉" in message
+        assert "Flight **DC-2026** has touched down at Delta International Airport." in message
+        assert "**1.** Read the city regulations in <#111>" in message
+        assert "**2.** Apply for citizenship in <#222> with `!check-in`" in message
+        assert "<@&333> a new arrival is waiting." in message
+        assert "{user}" not in message and "{current year}" not in message
+
+    def test_departure_message_escapes_markdown_and_mentions(self):
+        message = reg.build_departure_message("New **Arrival** <@&123> @here")
+        assert "New \\*\\*Arrival\\*\\*" in message
+        assert "@\u200bhere" in message
+        assert "New **Arrival**" not in message
+        assert " has boarded an exit flight and left Delta City." in message
+
+    def test_missing_airport_channel_warns_without_crashing(self, caplog):
+        guild = SimpleNamespace(get_channel=Mock(return_value=None))
+        member = SimpleNamespace(
+            id=21, bot=False, guild=guild, display_name="Lefty"
+        )
+        cog = _cog(_db())
+        with caplog.at_level(logging.WARNING, logger="delta_city.registration"):
+            asyncio.run(cog._on_member_leave(member))
+        assert "Airport channel" in caplog.text
+        assert "skipping departure announcement" in caplog.text
